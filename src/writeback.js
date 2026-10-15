@@ -434,3 +434,49 @@ export function literalInsertEdit(code, literal, props) {
   props.forEach((p) => { text += ", "; push(p, text.length); text += p.text; });
   return { start: last.end, end: last.end, text, insert: newSites };
 }
+
+/**
+ * Line diff of two versions of a file, as hunks with `context` unchanged lines around each change:
+ * [{ oldStart, newStart, lines: [{ t: " " | "-" | "+", s }] }]  (line numbers are 1-based)
+ */
+export function lineDiff(a, b, context = 2) {
+  const A = a.split("\n"), B = b.split("\n");
+  let pre = 0;
+  while (pre < A.length && pre < B.length && A[pre] === B[pre]) pre++;
+  let suf = 0;
+  while (suf < A.length - pre && suf < B.length - pre && A[A.length - 1 - suf] === B[B.length - 1 - suf]) suf++;
+  const a2 = A.slice(pre, A.length - suf), b2 = B.slice(pre, B.length - suf);
+  // LCS on the changed middle part (small: edits are local).
+  const n = a2.length, m = b2.length;
+  const ops = [];
+  if (n * m > 4e6) {
+    for (const s of a2) ops.push({ t: "-", s });
+    for (const s of b2) ops.push({ t: "+", s });
+  } else {
+    const L = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = a2[i] === b2[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    let i = 0, j = 0;
+    while (i < n || j < m) {
+      if (i < n && j < m && a2[i] === b2[j]) { ops.push({ t: " ", s: a2[i] }); i++; j++; }
+      else if (i < n && (j === m || L[i + 1][j] >= L[i][j + 1])) ops.push({ t: "-", s: a2[i++] });
+      else ops.push({ t: "+", s: b2[j++] });
+    }
+  }
+  const all = [...A.slice(0, pre).map((s) => ({ t: " ", s })), ...ops, ...A.slice(A.length - suf).map((s) => ({ t: " ", s }))];
+  // Line numbers of every op, then group the changes (plus context) into hunks.
+  let o = 1, nw = 1;
+  for (const op of all) { op.o = o; op.n = nw; if (op.t !== "+") o++; if (op.t !== "-") nw++; }
+  const ranges = [];
+  all.forEach((op, k) => {
+    if (op.t === " ") return;
+    const from = Math.max(0, k - context), to = Math.min(all.length - 1, k + context);
+    const last = ranges[ranges.length - 1];
+    if (last && from <= last[1] + 1) last[1] = to;
+    else ranges.push([from, to]);
+  });
+  return ranges.map(([from, to]) => ({
+    oldStart: all[from].o,
+    newStart: all[from].n,
+    lines: all.slice(from, to + 1).map(({ t, s }) => ({ t, s })),
+  }));
+}

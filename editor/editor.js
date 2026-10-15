@@ -32,6 +32,8 @@ const state = {
   pan: null,
   spaceDown: false,
   stopped: false,
+  treeQuery: "", // hierarchy search
+  treeMatches: [],
 };
 
 // ---------------------------------------------------------------- properties
@@ -55,6 +57,8 @@ const PROPS = {
   parent: { get: (o) => o.parent, set: (o, v) => { if (v && o.parent !== v) v.addChild(o); } },
   // Spine skeleton: "" = as created by the code, otherwise JSON { skeleton: keys[], atlas: keys[] }.
   spine: { get: (o) => o.__peSpine || "", set: (o, v) => setSpine(o, v) },
+  // Index among its siblings (draw order).
+  order: { get: (o) => (o.parent ? o.parent.getChildIndex(o) : 0), set: (o, v) => { if (o.parent) o.parent.setChildIndex(o, Math.max(0, Math.min(v, o.parent.children.length - 1))); } },
 };
 // Graphics fills: "gfill:0", "gfill:1"… map to the n-th fill instruction of the Graphics context.
 function fillInstructions(o) {
@@ -78,7 +82,7 @@ function propDef(p) {
   };
 }
 // Value properties are saved by replacing a literal, not by adjusting a number.
-const VALUE_TYPE = { text: "string", label: "string", tint: "color", textFill: "color", texture: "texture", parent: "parent", spine: "spine" };
+const VALUE_TYPE = { text: "string", label: "string", tint: "color", textFill: "color", texture: "texture", parent: "parent", spine: "spine", order: "order" };
 const valueTypeOf = (p) => VALUE_TYPE[p] || (p.startsWith("gfill:") ? "color" : null);
 const sameValue = (a, b) => (typeof a === "number" && typeof b === "number" ? Math.abs(a - b) < 1e-9 : a === b);
 
@@ -265,7 +269,8 @@ iframe.addEventListener("load", () => {
       c.className = "connecting hidden";
       win.addEventListener("keydown", onKey, true);
       setMode(state.mode);
-      setStatus(`Connected to ${state.project ? state.project.name : "the game"} — the game is running. Press Edit (Ctrl/Cmd+E) to select objects.`);
+      if (state.afterReload) { setStatus(state.afterReload, "ok"); state.afterReload = null; }
+      else setStatus(`Connected to ${state.project ? state.project.name : "the game"} — the game is running. Press Edit (Ctrl/Cmd+E) to select objects.`);
       loadComponents();
     } else if (tries === 40) {
       c.textContent = pe
@@ -514,7 +519,9 @@ function bestSite(meta, prop) {
   let best = null;
   for (const [kind, comp, factor] of candidatesOf(prop)) {
     const s = meta && meta.sites[kind];
-    if (s && (!best || s.seq > best.seq)) best = { ...s, kind, comp, factor };
+    // Lines inside pointer handlers (hover/press) only count when nothing else sets the property.
+    const better = (x, y) => (!!x.transient !== !!y.transient ? !x.transient : x.seq > y.seq);
+    if (s && (!best || better(s, best))) best = { ...s, kind, comp, factor };
   }
   return best;
 }
@@ -534,7 +541,7 @@ function revertMove(rec) {
  * Parent changes are saved first, on their own: if one can't be written, the move is undone before
  * the positions (which were adjusted to keep the object in place) are saved.
  */
-async function saveParents() {
+async function saveParents(reviewed = false) {
   const recs = [...state.pending.values()].filter((p) => p.prop === "parent");
   const msgs = [];
   msgs.files = [];
@@ -554,7 +561,7 @@ async function saveParents() {
   }
   if (edits.length) {
     const shared = edits.filter((e) => (state.pe.siteUse.get(e.site.id) || 0) > 1);
-    if (shared.length && !window.confirm(`The line that adds ${nameOf(shared[0].rec.obj)} adds ${state.pe.siteUse.get(shared[0].site.id)} objects. Moving it moves all of them. Continue?`)) return null;
+    if (shared.length && !reviewed && !window.confirm(`The line that adds ${nameOf(shared[0].rec.obj)} adds ${state.pe.siteUse.get(shared[0].site.id)} objects. Moving it moves all of them. Continue?`)) return null;
     let res;
     try {
       res = await (await fetch("/__pixi-editor/api/save", {
@@ -582,6 +589,39 @@ async function saveParents() {
   return msgs;
 }
 
+/** The request that writes an object's draw order: its parent line and its new neighbours' lines. */
+function orderRequest(o) {
+  const site = bestSite(metaOf(o), "parent");
+  if (!site || !o.parent) return null;
+  const kids = o.parent.children;
+  const i = kids.indexOf(o);
+  const siteOf = (x) => { const st = x && bestSite(metaOf(x), "parent"); return st ? st.id : null; };
+  return { siteId: site.id, nextSiteId: siteOf(kids[i + 1]), prevSiteId: siteOf(kids[i - 1]) };
+}
+
+/** Draw order changes, one at a time (each moves a line of code). Failed ones are put back. */
+async function saveOrders() {
+  const msgs = [];
+  msgs.files = [];
+  for (const [key, rec] of [...state.pending].filter(([, r]) => r.prop === "order")) {
+    const req = orderRequest(rec.obj);
+    let res = req ? null : { ok: false, error: `${nameOf(rec.obj)}: the line that adds it to its parent wasn't found` };
+    if (req) {
+      try {
+        res = await (await fetch("/__pixi-editor/api/order", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req) })).json();
+      } catch (err) { res = { ok: false, error: String(err) }; }
+    }
+    if (res.ok) { msgs.files.push(res.file); state.pending.delete(key); continue; }
+    setLive(rec.obj, { order: rec.original });
+    state.pending.delete(key);
+    msgs.push(`${nameOf(rec.obj)}: ${res.error} — order put back`);
+  }
+  if (msgs.files.length) state.info.clear();
+  updateSaveButton();
+  state.treeSig = "";
+  return msgs;
+}
+
 /** The value sent to the server for texture, parent and spine changes (null = can't be saved). */
 function saveValue(p) {
   if (p.prop === "texture") { const keys = textureKeys(p.current); return keys.length ? { keys } : null; }
@@ -597,16 +637,8 @@ function saveValue(p) {
   return null;
 }
 
-async function save() {
-  if (!pendingCount()) return;
-  const parentMsgs = await saveParents();
-  if (parentMsgs === null) { setStatus("Save canceled"); return; }
-  if (!pendingCount()) {
-    if (parentMsgs.length) setStatus(parentMsgs.join(" · "), "err");
-    else setStatus(`Saved to ${[...new Set(parentMsgs.files)].join(", ")}`, "ok");
-    renderInspector();
-    return;
-  }
+/** What saving the pending changes sends to the server (site edits and new lines). */
+function buildSave() {
   const siteEdits = new Map();
   const inserts = new Map();
   const unsaved = [];
@@ -614,6 +646,7 @@ async function save() {
   const compPlan = []; // [{ rec, target, kind }]
 
   for (const [key, p] of state.pending) {
+    if (p.prop === "order") continue; // saved on its own (saveOrders)
     const meta = metaOf(p.obj);
     const site = bestSite(meta, p.prop);
     const vtype = valueTypeOf(p.prop);
@@ -682,9 +715,34 @@ async function save() {
     }
   }
 
+  return { siteEdits, inserts, unsaved, plan, compPlan };
+}
+
+/** Saves, after showing the review dialog unless the user turned it off. */
+function save() {
+  if (!pendingCount()) return;
+  if (reviewEnabled()) openReview();
+  else saveNow();
+}
+
+async function saveNow({ reviewed = false } = {}) {
+  if (!pendingCount()) return;
+  const parentMsgs = await saveParents(reviewed);
+  if (parentMsgs === null) { setStatus("Save canceled"); return; }
+  const orderMsgs = await saveOrders();
+  parentMsgs.push(...orderMsgs);
+  parentMsgs.files.push(...orderMsgs.files);
+  if (!pendingCount()) {
+    if (parentMsgs.length) setStatus(parentMsgs.join(" · "), "err");
+    else setStatus(`Saved to ${[...new Set(parentMsgs.files)].join(", ")}`, "ok");
+    renderInspector();
+    return;
+  }
+  const { siteEdits, inserts, unsaved, plan, compPlan } = buildSave();
+
   // Lines shared by several objects (loops, helpers): confirm before changing all of them.
   const shared = [...siteEdits.keys()].filter((id) => (state.pe.siteUse.get(id) || 0) > 1);
-  if (shared.length) {
+  if (shared.length && !reviewed) {
     const n = Math.max(...shared.map((id) => state.pe.siteUse.get(id)));
     if (!window.confirm(`${shared.length} of these code lines create or move several objects (up to ${n}). Saving changes all of them. Save anyway?`)) {
       setStatus("Save canceled");
@@ -737,8 +795,169 @@ async function save() {
   if (unsaved.length) msgs.push(`No code line for: ${[...new Set(unsaved)].join(", ")}`);
   if (failed.size) msgs.push("those values were reverted");
   if (msgs.length) setStatus(msgs.join(" · "), "err");
-  else setStatus(`Saved to ${[...new Set([...parentMsgs.files, ...res.files])].join(", ")}${plan.some((x) => x.key.endsWith(":spine") && done.has(x.target)) ? " — press Reload to run the game with the new spine" : ""}`, "ok");
+  else {
+    const saved = `Saved to ${[...new Set([...parentMsgs.files, ...res.files])].join(", ")}`;
+    const spineSaved = plan.some((x) => x.key.endsWith(":spine") && done.has(x.target));
+    // The spine preview replaced the object, so the game's code still points at the old one:
+    // reload so the game runs with the new skeleton (only when nothing is left unsaved).
+    if (spineSaved && !pendingCount()) {
+      state.afterReload = `${saved} — game reloaded with the new spine`;
+      setStatus(`${saved} — reloading the game…`, "ok");
+      iframe.contentWindow.location.reload();
+    } else setStatus(`${saved}${spineSaved ? " — press Reload to run the game with the new spine" : ""}`, "ok");
+  }
   state.treeSig = "";
+}
+
+// ---------------------------------------------------------------- review changes before saving
+const REVIEW_KEY = "pixi-editor:review";
+function reviewEnabled() {
+  try { return localStorage.getItem(REVIEW_KEY) !== "off"; } catch { return true; }
+}
+const PROP_LABEL = {
+  x: "x", y: "y", scaleX: "scale x", scaleY: "scale y", rotation: "rotation", alpha: "alpha",
+  pivotX: "pivot x", pivotY: "pivot y", anchorX: "anchor x", anchorY: "anchor y", text: "text", label: "name",
+  tint: "tint", textFill: "text color", texture: "texture", parent: "parent", spine: "spine", order: "draw order",
+};
+function showValue(prop, v) {
+  if (prop === "rotation") return `${fmtNum((v * 180) / Math.PI, 1)}°`;
+  if (typeof v === "number") return VALUE_TYPE[prop] === "color" || prop.startsWith("gfill:") ? toHex(v) : fmtNum(v);
+  if (prop === "texture") return textureKeys(v)[0] || "(texture)";
+  if (prop === "parent") return v ? nameOf(v) : "—";
+  if (prop === "spine") return v ? baseName(JSON.parse(v).skeleton[0]) : "as in the code";
+  if (prop === "order") return `#${v + 1}`;
+  if (typeof v === "string") return JSON.stringify(v.length > 40 ? v.slice(0, 39) + "…" : v);
+  return String(v);
+}
+/** Puts one pending change back to its original value. */
+function discardChange(item) {
+  if (item.rec) {
+    const r = item.rec;
+    if (r.prop === "parent") revertMove(r);
+    else { setLive(r.obj, { [r.prop]: r.original }); state.pending.delete(item.key); }
+  } else {
+    const snap = compSnapshot(item.c.obj);
+    if (item.c.original) snap[item.c.type] = { ...item.c.original }; else delete snap[item.c.type];
+    compRestore(item.c.obj, snap);
+  }
+  afterChange();
+  renderInspector();
+}
+
+/** Draws file diffs (from the server: [{ file, hunks }]) into `box`. */
+function renderDiffs(box, diffs) {
+  for (const d of diffs || []) {
+    if (!d.hunks.length) continue;
+    const file = document.createElement("div");
+    file.className = "diff-file";
+    const head = document.createElement("b");
+    head.textContent = d.file;
+    file.appendChild(head);
+    for (const h of d.hunks) {
+      const hunk = document.createElement("div");
+      hunk.className = "diff-hunk";
+      let o = h.oldStart, n = h.newStart;
+      for (const l of h.lines) {
+        const line = document.createElement("div");
+        line.className = "diff-line" + (l.t === "+" ? " add" : l.t === "-" ? " del" : "");
+        line.innerHTML = `<span class="ln"></span><span class="ln"></span><span class="sign"></span><span class="code"></span>`;
+        const [lo, ln, sign, codeEl] = line.children;
+        lo.textContent = l.t === "+" ? "" : o;
+        ln.textContent = l.t === "-" ? "" : n;
+        sign.textContent = l.t === " " ? "" : l.t;
+        codeEl.textContent = l.s;
+        if (l.t !== "+") o++;
+        if (l.t !== "-") n++;
+        hunk.appendChild(line);
+      }
+      file.appendChild(hunk);
+    }
+    box.appendChild(file);
+  }
+}
+
+let reviewToken = 0;
+async function openReview() {
+  const modal = $("#review-modal");
+  const list = $("#review-changes");
+  const diffBox = $("#review-diff");
+  const toggle = $("#review-toggle");
+  toggle.checked = true;
+  toggle.parentElement.style.display = "";
+  $("#review-title").textContent = "Review changes";
+  $("#review-save").textContent = "Save to code";
+  $("#review-cancel").textContent = "Keep editing";
+  modal.classList.remove("hidden");
+  const close = () => { modal.classList.add("hidden"); window.removeEventListener("keydown", onKeyReview, true); };
+  const onKeyReview = (e) => {
+    if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); close(); }
+    if (e.key === "Enter" || ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s")) { e.stopPropagation(); e.preventDefault(); $("#review-save").click(); }
+  };
+  window.addEventListener("keydown", onKeyReview, true);
+  $("#review-cancel").onclick = close;
+  modal.onclick = (e) => { if (e.target === modal) close(); };
+  toggle.onchange = () => { try { localStorage.setItem(REVIEW_KEY, toggle.checked ? "on" : "off"); } catch { /* private mode */ } };
+  $("#review-save").onclick = () => { close(); saveNow({ reviewed: true }); };
+
+  const refresh = async () => {
+    const token = ++reviewToken;
+    if (!pendingCount()) { close(); setStatus("Nothing to save"); return; }
+    // Left: the changes, each with Discard.
+    const items = [
+      ...[...state.pending].map(([key, rec]) => ({ key, rec, obj: rec.obj })),
+      ...compChanges().map((c) => ({ c, obj: c.obj })),
+    ];
+    list.innerHTML = "";
+    for (const it of items) {
+      const row = document.createElement("div");
+      row.className = "change";
+      row.innerHTML = `<div class="what"><span class="obj"></span><span class="val"></span></div><button class="ghost">Discard</button>`;
+      if (it.rec) {
+        row.querySelector(".obj").textContent = `${nameOf(it.obj)} · ${PROP_LABEL[it.rec.prop] || it.rec.prop.replace(/^gfill:(\d+)$/, (_, n) => `fill ${+n + 1}`)}`;
+        row.querySelector(".val").textContent = `${showValue(it.rec.prop, it.rec.original)} → ${showValue(it.rec.prop, it.rec.current)}`;
+      } else {
+        row.querySelector(".obj").textContent = `${nameOf(it.obj)} · ${it.c.type}`;
+        row.querySelector(".val").textContent = !it.c.original ? "added" : !it.c.current ? "removed" : "changed";
+      }
+      row.querySelector("button").onclick = () => { discardChange(it); refresh(); };
+      list.appendChild(row);
+    }
+    $("#review-sub").textContent = `${items.length} change${items.length > 1 ? "s" : ""}`;
+    // Right: what the code will look like.
+    diffBox.innerHTML = `<p class="note" style="padding:10px">Computing the changes…</p>`;
+    const { siteEdits, inserts, unsaved } = buildSave();
+    let res;
+    try {
+      res = await (await fetch("/__pixi-editor/api/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ siteEdits: [...siteEdits.values()], inserts: [...inserts.values()].map(({ obj, ...rest }) => rest) }),
+      })).json();
+    } catch (err) {
+      res = { diffs: [], errors: [`Preview failed: ${err}`] };
+    }
+    // Draw order changes are written one by one: preview each.
+    for (const rec of [...state.pending.values()].filter((r) => r.prop === "order")) {
+      const req = orderRequest(rec.obj);
+      if (!req) { (res.errors = res.errors || []).push(`${nameOf(rec.obj)}: the line that adds it to its parent wasn't found`); continue; }
+      try {
+        const r = await (await fetch("/__pixi-editor/api/order", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...req, dryRun: true }) })).json();
+        if (r.ok) res.diffs = [...(res.diffs || []), ...r.diffs.map((d) => ({ ...d, file: `${d.file} — order of ${nameOf(rec.obj)}` }))];
+        else (res.errors = res.errors || []).push(`${nameOf(rec.obj)}: ${r.error}`);
+      } catch { /* shown on save */ }
+    }
+    if (token !== reviewToken) return;
+    diffBox.innerHTML = "";
+    const msg = (text, cls = "") => { const p = document.createElement("div"); p.className = `review-msg ${cls}`; p.textContent = text; list.appendChild(p); };
+    for (const e of res.errors || []) msg(e, "err");
+    if (unsaved.length) msg(`Can't be saved (no code line): ${[...new Set(unsaved)].join(", ")}`, "err");
+    const shared = [...siteEdits.keys()].filter((id) => (state.pe.siteUse.get(id) || 0) > 1);
+    if (shared.length) msg(`${shared.length} of these lines create or move several objects (up to ${Math.max(...shared.map((id) => state.pe.siteUse.get(id)))}): the change applies to all of them.`);
+    for (const f of res.newFiles || []) msg(`New file: ${f} (the components module).`);
+    renderDiffs(diffBox, res.diffs);
+    if (!diffBox.children.length) diffBox.innerHTML = `<p class="note" style="padding:10px">No code changes.</p>`;
+  };
+  await refresh();
 }
 
 // ---------------------------------------------------------------- viewport: drawing
@@ -1102,6 +1321,8 @@ function onKey(e) {
   const mod = e.metaKey || e.ctrlKey;
   if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); save(); return; }
   if (mod && e.key.toLowerCase() === "e") { e.preventDefault(); setMode(state.mode === "edit" ? "play" : "edit"); return; }
+  if (mod && e.key.toLowerCase() === "f") { e.preventDefault(); treeSearch.focus(); treeSearch.select(); return; }
+  if (mod && e.key.toLowerCase() === "d" && state.mode === "edit" && !(e.target && /INPUT|TEXTAREA/.test(e.target.tagName))) { e.preventDefault(); duplicateSelected(); return; }
   if (state.mode !== "edit") return;
   const inInput = e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA");
   if (mod && e.key.toLowerCase() === "z" && !inInput) { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
@@ -1109,6 +1330,7 @@ function onKey(e) {
   if (inInput) return;
   if (e.key === " " && !e.repeat) { state.spaceDown = true; overlay.style.cursor = "grab"; e.preventDefault(); return; }
   if (e.key === "Escape") { select(null); return; }
+  if ((e.key === "Delete" || e.key === "Backspace") && state.selected) { e.preventDefault(); deleteSelected(); return; }
   if (!mod && (e.key === "f" || e.key === "F")) { zoomFit(); return; }
   if (!mod && (e.key === "v" || e.key === "V")) { setTool("move"); return; }
   if (!mod && (e.key === "p" || e.key === "P")) { setTool("pivot"); return; }
@@ -1142,11 +1364,31 @@ function select(o) {
 
 // ---------------------------------------------------------------- hierarchy
 const MAX_CHILDREN = 150;
+/** Objects whose name or type matches the hierarchy search, plus their ancestors (null = no search). */
+function treeFilter() {
+  const q = state.treeQuery.trim().toLowerCase();
+  if (!q || !state.app) return null;
+  const matches = [];
+  const keep = new Set();
+  (function walk(o) {
+    for (const c of o.children) {
+      if (nameOf(c).toLowerCase().includes(q) || typeOf(c).toLowerCase() === q) {
+        matches.push(c);
+        for (let p = c; p && !keep.has(p); p = p.parent) keep.add(p);
+      }
+      walk(c);
+    }
+  })(state.app.stage);
+  keep.add(state.app.stage);
+  return { q, matches, keep };
+}
+
 function treeSignature() {
   if (!state.app) return "none";
-  const parts = [];
+  const parts = [state.treeQuery];
   (function walk(o) {
     parts.push(uid(o), o.children.length, o.visible ? 1 : 0, isModified(o) ? 1 : 0);
+    if (state.treeQuery) { for (const c of o.children) walk(c); return; } // search: the whole scene
     if (state.expanded.has(o)) for (const c of o.children.slice(0, MAX_CHILDREN)) walk(c);
   })(state.app.stage);
   return parts.join(",");
@@ -1164,20 +1406,26 @@ function renderTree(scrollToSel = false) {
   const sig = treeSignature();
   if (sig === state.treeSig) { paintTreeSelection(scrollToSel); return; }
   state.treeSig = sig;
+  const filter = treeFilter();
+  state.treeMatches = filter ? filter.matches : [];
+  $("#tree-count").textContent = filter ? `${filter.matches.length}` : "";
   const frag = document.createDocumentFragment();
   let selEl = null;
   (function add(o, depth) {
+    if (filter && !filter.keep.has(o)) return;
     const row = document.createElement("div");
     row.className = "node" + (o === state.selected ? " selected" : "") + (o.visible ? "" : " hidden");
     row.style.paddingLeft = `${6 + depth * 14}px`;
     row._obj = o;
     const has = o.children.length > 0;
-    const open = state.expanded.has(o);
+    const open = filter ? o.children.some((c) => filter.keep.has(c)) : state.expanded.has(o);
+    if (filter && o !== state.app.stage && !filter.matches.includes(o)) row.classList.add("match-off");
     const caret = document.createElement("span");
     caret.className = "caret" + (has ? " has" : "");
     caret.textContent = has ? (open ? "▼" : "▶") : "";
     caret.onclick = (ev) => {
       ev.stopPropagation();
+      if (filter) return;
       open ? state.expanded.delete(o) : state.expanded.add(o);
       state.treeSig = ""; renderTree();
     };
@@ -1187,6 +1435,15 @@ function renderTree(scrollToSel = false) {
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = nameOf(o);
+    if (filter) {
+      const n = nameOf(o), i = n.toLowerCase().indexOf(filter.q);
+      if (i >= 0) {
+        name.textContent = "";
+        const mark = document.createElement("mark");
+        mark.textContent = n.slice(i, i + filter.q.length);
+        name.append(n.slice(0, i), mark, n.slice(i + filter.q.length));
+      }
+    }
     if (isModified(o)) { const m = document.createElement("span"); m.className = "mod"; m.textContent = " •"; name.appendChild(m); }
     const type = document.createElement("span");
     type.className = "type";
@@ -1210,19 +1467,36 @@ function renderTree(scrollToSel = false) {
       row.ondragstart = (ev) => { state.dragNode = o; ev.dataTransfer.effectAllowed = "move"; ev.dataTransfer.setData("text/plain", nameOf(o)); };
       row.ondragend = () => { state.dragNode = null; treeEl.querySelectorAll(".drop").forEach((r) => r.classList.remove("drop")); };
     }
+    // Top/bottom edge of a row: put it before/after that object (draw order). Middle: inside it.
+    const zone = (ev) => {
+      const r = row.getBoundingClientRect();
+      const y = ev.clientY - r.top;
+      const moving = state.dragNode;
+      const edgeOk = moving && o !== state.app.stage && o !== moving && canHoldChildren(o.parent) && !isInside(o.parent, moving);
+      if (edgeOk && y < r.height * 0.3) return "before";
+      if (edgeOk && y > r.height * 0.7) return "after";
+      if (canDropOn(moving, o)) return "into";
+      return edgeOk ? (y < r.height / 2 ? "before" : "after") : null;
+    };
+    const clearDrop = () => row.classList.remove("drop", "drop-before", "drop-after");
     row.ondragover = (ev) => {
-      if (!canDropOn(state.dragNode, o)) return;
+      const z = zone(ev);
+      clearDrop();
+      if (!z) return;
       ev.preventDefault();
       ev.dataTransfer.dropEffect = "move";
-      row.classList.add("drop");
+      row.classList.add(z === "into" ? "drop" : `drop-${z}`);
     };
-    row.ondragleave = () => row.classList.remove("drop");
+    row.ondragleave = clearDrop;
     row.ondrop = (ev) => {
       ev.preventDefault();
-      row.classList.remove("drop");
+      const z = zone(ev);
+      clearDrop();
       const moving = state.dragNode;
       state.dragNode = null;
-      if (moving) reparent(moving, o);
+      if (!moving || !z) return;
+      if (z === "into") reparent(moving, o);
+      else placeNextTo(moving, o, z);
     };
     row.ondblclick = (ev) => {
       if (o === state.app.stage) return;
@@ -1249,7 +1523,7 @@ function renderTree(scrollToSel = false) {
     frag.appendChild(row);
     if (o === state.selected) selEl = row;
     if (has && open) {
-      const kids = o.children;
+      const kids = filter ? o.children.filter((c) => filter.keep.has(c)) : o.children;
       for (const c of kids.slice(0, MAX_CHILDREN)) add(c, depth + 1);
       if (kids.length > MAX_CHILDREN) {
         const more = document.createElement("div");
@@ -1266,6 +1540,31 @@ function renderTree(scrollToSel = false) {
   if (scrollToSel && selEl) selEl.scrollIntoView({ block: "nearest" });
 }
 setInterval(() => renderTree(), 600);
+
+// Hierarchy search: shows the matching objects with their parents. Enter selects the next match
+// (and opens the path to it once the search is cleared), Escape clears.
+const treeSearch = $("#tree-search");
+let treeMatchIndex = -1;
+treeSearch.addEventListener("input", () => {
+  state.treeQuery = treeSearch.value;
+  treeMatchIndex = -1;
+  state.treeSig = "";
+  renderTree();
+});
+treeSearch.addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Escape") {
+    if (treeSearch.value) { treeSearch.value = ""; treeSearch.dispatchEvent(new Event("input")); }
+    else treeSearch.blur();
+    return;
+  }
+  if (e.key === "Enter" && state.treeMatches.length) {
+    e.preventDefault();
+    treeMatchIndex = (treeMatchIndex + (e.shiftKey ? -1 : 1) + state.treeMatches.length) % state.treeMatches.length;
+    select(state.treeMatches[treeMatchIndex]);
+    paintTreeSelection(true);
+  }
+});
 
 // ---------------------------------------------------------------- inspector
 const FIELDS = [
@@ -1478,7 +1777,9 @@ function renderInspector() {
   // Header: editable name (saved in the code as the object's `label`)
   const head = document.createElement("div");
   head.className = "obj-head";
-  head.innerHTML = `<input class="obj-name" spellcheck="false" title="Rename — saved as the object's label"><div class="obj-type"></div>`;
+  head.innerHTML = `<div class="obj-row"><input class="obj-name" spellcheck="false" title="Rename — saved as the object's label"><button class="ghost icon-btn" data-act="dup" title="Duplicate (Ctrl/Cmd+D)">⧉</button><button class="ghost icon-btn" data-act="del" title="Delete (Delete key)">🗑</button></div><div class="obj-type"></div>`;
+  head.querySelector('[data-act="dup"]').onclick = () => duplicateSelected();
+  head.querySelector('[data-act="del"]').onclick = () => deleteSelected();
   const nameInput = head.querySelector(".obj-name");
   nameInput.value = nameOf(o);
   nameInput.addEventListener("keydown", (e) => {
@@ -1527,7 +1828,7 @@ function renderInspector() {
         if (!inf) continue;
         const el = document.createElement("div");
         el.className = "src";
-        const kind = id === m.declId ? "creation" : inf.kind;
+        const kind = id === m.declId ? "creation" : inf.kind + (Object.values(m.sites).some((x) => x.id === id && x.transient) ? " · on pointer" : "");
         el.innerHTML = `<div class="loc"><b></b><span class="kind"></span><button class="open-ide" title="Open this line in VS Code">Open ↗</button></div><code></code>`;
         el.querySelector("b").textContent = `${inf.file}:${inf.line}`;
         el.querySelector(".kind").textContent = kind;
@@ -2424,8 +2725,25 @@ const isInside = (o, ancestor) => { for (let p = o; p; p = p.parent) if (p === a
 function canDropOn(o, target) {
   return !!o && !!target && target !== o.parent && canHoldChildren(target) && !isInside(target, o);
 }
+/** Moves `o` right before/after `sibling` in the draw order (into sibling's parent if needed). */
+function placeNextTo(o, sibling, place) {
+  const parent = sibling.parent;
+  if (!parent || o === sibling) return;
+  if (o.parent !== parent) reparent(o, parent, true);
+  const from = parent.getChildIndex(o);
+  let to = parent.getChildIndex(sibling) + (place === "after" ? 1 : 0);
+  if (from < to) to--;
+  if (to === from) { renderTree(true); return; }
+  setLive(o, { order: to });
+  commit(o, { order: from }, { order: to });
+  state.treeSig = "";
+  renderTree(true);
+  renderInspector();
+  setStatus(`${nameOf(o)} is now drawn ${place} ${nameOf(sibling)} — save to write it in the code`);
+}
+
 /** Moves `o` into `target`, keeping it in the same place on screen. */
-function reparent(o, target) {
+function reparent(o, target, quiet = false) {
   if (!canDropOn(o, target)) return;
   const before = { parent: o.parent, x: o.x, y: o.y };
   const g = o.parent.toGlobal({ x: o.x, y: o.y });
@@ -2437,8 +2755,138 @@ function reparent(o, target) {
   state.treeSig = "";
   renderTree(true);
   renderInspector();
-  setStatus(`Moved ${nameOf(o)} into ${nameOf(target)} — save to write it in the code`);
+  if (!quiet) setStatus(`Moved ${nameOf(o)} into ${nameOf(target)} — save to write it in the code`);
 }
 
 // Small hook for automated tests (Playwright): select an object of the game.
 window.pixiEditor = { select: (o) => select(o) };
+
+
+// ---------------------------------------------------------------- delete and duplicate
+/** Shows a code diff and asks to confirm (same dialog as the save review). */
+function confirmCode({ title, sub, notes = [], diffs, confirmLabel }) {
+  return new Promise((resolve) => {
+    const modal = $("#review-modal");
+    $("#review-title").textContent = title;
+    $("#review-sub").textContent = sub || "";
+    $("#review-toggle").parentElement.style.display = "none";
+    $("#review-save").textContent = confirmLabel;
+    $("#review-cancel").textContent = "Cancel";
+    const list = $("#review-changes");
+    list.innerHTML = "";
+    for (const n of notes) { const p = document.createElement("div"); p.className = "review-msg"; p.textContent = n; list.appendChild(p); }
+    const box = $("#review-diff");
+    box.innerHTML = "";
+    renderDiffs(box, diffs);
+    modal.classList.remove("hidden");
+    const done = (ok) => { modal.classList.add("hidden"); window.removeEventListener("keydown", onKeyDlg, true); resolve(ok); };
+    const onKeyDlg = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); done(false); }
+      if (e.key === "Enter") { e.stopPropagation(); e.preventDefault(); done(true); }
+    };
+    window.addEventListener("keydown", onKeyDlg, true);
+    $("#review-cancel").onclick = () => done(false);
+    $("#review-save").onclick = () => done(true);
+    modal.onclick = (e) => { if (e.target === modal) done(false); };
+  });
+}
+
+async function objectRequest(body) {
+  try {
+    return await (await fetch("/__pixi-editor/api/object", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Forgets unsaved changes and undo steps of an object and everything inside it. */
+function forgetObject(o) {
+  const gone = (x) => !!x && isInside(x, o);
+  for (const [k, rec] of state.pending) if (gone(rec.obj)) state.pending.delete(k);
+  for (const [k, rec] of state.compOriginal) if (gone(rec.obj)) state.compOriginal.delete(k);
+  state.undo = state.undo.filter((e) => !gone(e.obj));
+  state.redo = state.redo.filter((e) => !gone(e.obj));
+}
+
+async function deleteSelected() {
+  const o = state.selected;
+  if (!o || o === state.app.stage) return;
+  const m = metaOf(o);
+  if (!m || !m.declId) { setStatus(`${nameOf(o)} is not linked to the code that creates it, so it can't be deleted from here.`, "err"); return; }
+  setStatus(`Checking ${nameOf(o)}'s code…`);
+  const plan = await objectRequest({ action: "delete", declId: m.declId, dryRun: true });
+  if (!plan.ok) { setStatus(plan.error, "err"); return; }
+  const notes = [`Deletes ${nameOf(o)} and every line that sets it up.`];
+  const uses = state.pe.siteUse.get(m.declId) || 0;
+  if (uses > 1) notes.push(`⚠ This code creates ${uses} objects (a loop or a helper): all of them go away.`);
+  const linkedKids = [];
+  (function walk(x) { for (const c of x.children) { const cm = metaOf(c); if (cm && cm.declId) linkedKids.push(nameOf(c)); walk(c); } })(o);
+  if (linkedKids.length) notes.push(`Its children created elsewhere in the code (${linkedKids.slice(0, 4).join(", ")}${linkedKids.length > 4 ? "…" : ""}) stay in the code but are no longer added to the scene.`);
+  if (!(await confirmCode({ title: `Delete ${nameOf(o)}`, sub: "These lines are removed from the code", notes, diffs: plan.diffs, confirmLabel: "Delete" }))) { setStatus("Delete canceled"); return; }
+  const res = await objectRequest({ action: "delete", declId: m.declId });
+  if (!res.ok) { setStatus(res.error, "err"); return; }
+  forgetObject(o);
+  if (o.parent) o.parent.removeChild(o);
+  select(null);
+  state.info.clear();
+  state.treeSig = "";
+  updateSaveButton();
+  render();
+  setStatus(`Deleted ${nameOf(o)} from ${res.file}`, "ok");
+}
+
+/** A live copy of a display object for the preview (its code is copied on the server). */
+function cloneLive(o) {
+  const P = state.PIXI;
+  let c = null;
+  try {
+    if (isSpine(o)) {
+      const sp = spineOf(o);
+      if (sp) {
+        c = o.constructor.from({ skeleton: sp.skeleton[0], atlas: sp.atlas[0] });
+        const playing = o.state && o.state.tracks && o.state.tracks[0] && o.state.tracks[0].animation;
+        if (playing) c.state.setAnimation(0, playing.name, true);
+      }
+    } else if ((P.Text && o instanceof P.Text) || (P.BitmapText && o instanceof P.BitmapText) || (P.HTMLText && o instanceof P.HTMLText)) {
+      c = new o.constructor({ text: o.text, style: o.style && o.style.clone ? o.style.clone() : o.style });
+    } else if (P.Sprite && o instanceof P.Sprite) {
+      c = new P.Sprite(o.texture);
+    } else if (P.Graphics && o instanceof P.Graphics) {
+      c = new P.Graphics(o.context);
+    } else if (o.constructor === P.Container && !o.children.length) {
+      c = new P.Container();
+    }
+  } catch { c = null; }
+  if (!c) return null;
+  for (const k of ["position", "scale", "pivot", "skew"]) c[k].copyFrom(o[k]);
+  if (o.anchor && c.anchor) c.anchor.copyFrom(o.anchor);
+  for (const k of ["rotation", "alpha", "visible", "tint", "label", "zIndex", "blendMode", "eventMode", "cursor"]) { try { if (o[k] !== undefined) c[k] = o[k]; } catch { /* read-only */ } }
+  return c;
+}
+
+async function duplicateSelected() {
+  const o = state.selected;
+  if (!o || o === state.app.stage) return;
+  const m = metaOf(o);
+  if (!m || !m.declId) { setStatus(`${nameOf(o)} is not linked to the code that creates it, so it can't be duplicated from here.`, "err"); return; }
+  if (isModified(o)) { setStatus(`Save ${nameOf(o)}'s changes first, so the copy gets them too.`, "err"); return; }
+  setStatus(`Duplicating ${nameOf(o)}…`);
+  const res = await objectRequest({ action: "duplicate", declId: m.declId });
+  if (!res.ok) { setStatus(res.error, "err"); return; }
+  state.info.clear();
+  const c = cloneLive(o);
+  if (!c) {
+    state.afterReload = `Duplicated ${nameOf(o)} as ${res.name} (${res.file}:${res.line}) — game reloaded`;
+    setStatus(`Duplicated as ${res.name} — reloading the game to show it…`, "ok");
+    iframe.contentWindow.location.reload();
+    return;
+  }
+  const p = o.parent;
+  p.addChildAt(c, p.getChildIndex(o) + 1);
+  state.pe.d(c, res.declId, res.name, res.opts);
+  for (const st of res.sites || []) state.pe.s(c, st.kind, st.id);
+  state.treeSig = "";
+  select(c);
+  render();
+  setStatus(`Duplicated ${nameOf(o)}${res.name !== nameOf(o) ? ` as ${res.name}` : ""} — ${res.file}:${res.line}. It's in the same place: drag it away.`, "ok");
+}

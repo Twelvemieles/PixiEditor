@@ -103,6 +103,29 @@ function isCreation(node) {
   return false;
 }
 
+// Pointer events: { events: { pointerover: (sp) => … } }, onPointerDown: …, obj.on("pointerout", …)
+const POINTER_EVENT_RE = /^(on)?(pointer|mouse|touch|click|tap|hover|press|release|rightclick|rightdown|rightup)/i;
+const LISTEN_RE = /^(on|once|addListener|addEventListener)$/;
+const FUNCTION_TYPES = new Set(["ArrowFunctionExpression", "FunctionExpression", "ObjectMethod", "ClassMethod"]);
+/** True when the innermost-to-outermost function chain contains a pointer event handler. */
+function inPointerHandler(parents) {
+  for (let i = parents.length - 1; i >= 0; i--) {
+    const fn = parents[i];
+    if (!FUNCTION_TYPES.has(fn.type)) continue;
+    const keyName = (k) => (k && (k.type === "Identifier" ? k.name : k.type === "StringLiteral" ? k.value : null)) || "";
+    if (fn.type === "ObjectMethod" && POINTER_EVENT_RE.test(keyName(fn.key))) return true;
+    const p = parents[i - 1];
+    if (!p) continue;
+    if (p.type === "ObjectProperty" && p.value === fn && POINTER_EVENT_RE.test(keyName(p.key))) return true;
+    if (p.type === "AssignmentExpression" && p.right === fn && p.left.type === "MemberExpression" && POINTER_EVENT_RE.test(keyName(p.left.property))) return true;
+    if (p.type === "CallExpression" && p.arguments.includes(fn) && p.callee.type === "MemberExpression" && LISTEN_RE.test(keyName(p.callee.property))) {
+      const ev = p.arguments[0];
+      if (ev && ev.type === "StringLiteral" && POINTER_EVENT_RE.test(ev.value)) return true;
+    }
+  }
+  return false;
+}
+
 function lineIndent(code, pos) {
   const lineStart = code.lastIndexOf("\n", pos - 1) + 1;
   const m = /^[ \t]*/.exec(code.slice(lineStart));
@@ -128,11 +151,15 @@ export function instrument(code, file, nextId) {
   const sites = [];
   const decls = [];
 
+  let currentParents = [];
   const wrapObj = (objNode, kind, id) => {
     const site = sites.find((x) => x.id === id);
     if (site) site.obj = code.slice(objNode.start, objNode.end); // e.g. "scoreText", "this.title"
+    // Lines inside pointer handlers (hover/press states) never replace the object's setup line.
+    const transient = inPointerHandler(currentParents);
+    if (site && transient) site.transient = true;
     s.appendLeft(objNode.start, `${PE}.s(`);
-    s.prependRight(objNode.end, `, ${JSON.stringify(kind)}, ${JSON.stringify(id)})`);
+    s.prependRight(objNode.end, `, ${JSON.stringify(kind)}, ${JSON.stringify(id)}${transient ? ", 1" : ""})`);
   };
   const arg = (n) => ({ start: n.start, end: n.end, text: code.slice(n.start, n.end) });
   const objProp = (obj, key) =>
@@ -308,6 +335,7 @@ export function instrument(code, file, nextId) {
   }
 
   walk(ast.program, [], (node, parents) => {
+    currentParents = parents;
     // --- addComponent(E, Type, { ...params })
     if (
       node.type === "CallExpression" && node.callee.type === "Identifier" && node.callee.name === "addComponent" &&

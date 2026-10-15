@@ -7,8 +7,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
 import { instrument } from "./instrument.js";
 import { parse, parseExpression } from "@babel/parser";
-import { planEdits, planImport, findLiteral, detectQuote, quoteString, fmt } from "./writeback.js";
+import { planEdits, planImport, findLiteral, detectQuote, quoteString, fmt, lineDiff } from "./writeback.js";
 import { FACTORY_RE, instrument as instrumentCode } from "./instrument.js";
+import { analyzeObject, deleteEdits, duplicateEdits, pruneImports, namesIn, moveEdits } from "./refactor.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNTIME = fs.readFileSync(path.resolve(HERE, "runtime.js"), "utf8");
@@ -35,14 +36,24 @@ export default function pixiEditor() {
     const key = path.normalize(file);
     if (!selfWrites.has(key)) return false;
     const expected = selfWrites.get(key);
-    selfWrites.delete(key);
-    try { return (await read()) === expected; } catch { return false; }
+    // Kept while the file still has the editor's contents: Vite 6+ calls hotUpdate once per
+    // environment (client, ssr…), and every call must be told it's ours.
+    let same = false;
+    try { same = (await read()) === expected; } catch { /* deleted */ }
+    if (!same) selfWrites.delete(key);
+    return same;
   }
 
-  function register(file, siteList, declList) {
+  /**
+   * Records the code sites of a freshly transformed file. When the file still has the contents the
+   * editor wrote, the previous sites stay valid too (the game may still use them: Vite can
+   * re-transform a file without reloading the page).
+   */
+  function register(file, siteList, declList, code) {
     const old = byFile.get(file);
-    if (old) for (const id of old) { sites.delete(id); decls.delete(id); }
-    const ids = new Set();
+    const ours = code != null && selfWrites.get(path.normalize(file)) === code;
+    if (old && !ours) for (const id of old) { sites.delete(id); decls.delete(id); }
+    const ids = ours && old ? old : new Set();
     for (const s of siteList) { s.file = file; sites.set(s.id, s); ids.add(s.id); }
     for (const d of declList) { d.file = file; decls.set(d.id, d); ids.add(d.id); }
     byFile.set(file, ids);
@@ -291,6 +302,159 @@ export default function pixiEditor() {
     };
   }
 
+  // ---------------------------------------------------------------- deleting and duplicating objects
+  /**
+   * Deletes or duplicates the code of an object (see refactor.js). With `dryRun`, returns the diff
+   * that would be written.
+   */
+  async function objectAction(b) {
+    const verb = b.action === "duplicate" ? "duplicate" : "delete";
+    const decl = decls.get(b.declId);
+    if (!decl) throw new Error("This object is not linked to its code (reload the game).");
+    const file = decl.file;
+    const original = fs.readFileSync(file, "utf8");
+    const a = analyzeObject(original, decl);
+    const rel = path.relative(root, file);
+    // Other code that uses the object only blocks deleting it: a copy simply doesn't get those uses.
+    const blocked = verb === "delete" ? !a.ok : !a.declStmt && !(a.parts.length === 1 && a.parts[0].kind === "stmt");
+    if (blocked) {
+      const why = a.blockers.slice(0, 3).map((x) => (x.line ? `line ${x.line}: ${x.text}` : x.text)).join(" · ");
+      return { ok: false, error: `Can't ${verb} ${decl.name} automatically — ${why} (${rel}). Change that code first.` };
+    }
+    let edits, newName = null;
+    if (verb === "delete") edits = deleteEdits(original, a);
+    else {
+      if (decl.access) {
+        const base = decl.access.replace(/\d+$/, "");
+        newName = `${base}2`;
+        for (let i = 3; new RegExp(`\\b${newName}\\b`).test(original); i++) newName = `${base}${i}`;
+      }
+      const dup = duplicateEdits(original, a, decl.access, newName);
+      if (dup.errors.length) return { ok: false, error: `Can't duplicate ${decl.name} automatically — ${dup.errors.join(" ")}` };
+      edits = dup.edits;
+      if (dup.standalone) newName = null;
+    }
+    let code = applyText(original, edits);
+    let prune = [];
+    if (verb === "delete") {
+      const removedNames = namesIn(edits.map((e) => original.slice(e.start, e.end)).join("\n"));
+      prune = pruneImports(code, removedNames);
+      code = applyText(code, prune);
+    }
+    const formatted = await formatLikeProject(file, original, code);
+    if (b.dryRun) return { ok: true, diffs: [{ file: rel, hunks: lineDiff(original, formatted || code) }] };
+
+    // For real: keep the registry of code sites in sync.
+    const ids = byFile.get(file) || new Set();
+    byFile.set(file, ids);
+    const scratch = { applied: [], inserted: [], saved: 0 };
+    let copied = null;
+    if (verb === "delete") {
+      const inside = (pos) => edits.some((e) => pos >= e.start && pos < Math.max(e.end, e.start + 1));
+      for (const id of [...ids]) {
+        const st = sites.get(id), d = decls.get(id);
+        if ((st && inside(st.args[0].start)) || (d && d.start != null && inside(d.start))) { sites.delete(id); decls.delete(id); ids.delete(id); }
+      }
+      code = applyEdits(file, original, edits.map((e) => ({ ...e })), scratch);
+      if (prune.length) code = applyEdits(file, code, prune.map((e) => ({ ...e })), scratch);
+    } else {
+      const main = edits[0]; // the copied statements, inserted after the original ones
+      code = applyEdits(file, original, edits.map((e) => ({ ...e })), scratch);
+      const shift = edits.filter((e) => e !== main && e.start < main.start).reduce((n, e) => n + e.text.length - (e.end - e.start), 0);
+      copied = { start: main.start + shift, end: main.start + shift + main.text.length };
+    }
+    let result = { ok: true, file: rel };
+    if (copied) {
+      // Register the copy's declaration and code sites so it can be edited right away.
+      const out = instrumentCode(code, file, nextId);
+      const inRange = (pos) => pos >= copied.start && pos < copied.end;
+      const nd = out && out.decls.find((d) => inRange(d.start) && (!newName || d.access === newName));
+      if (!nd) throw new Error("Could not find the copied code.");
+      nd.file = file;
+      decls.set(nd.id, nd);
+      ids.add(nd.id);
+      const optIds = new Set(Object.values(nd.opts || {}));
+      const newSites = out.sites.filter((st) => optIds.has(st.id) || (inRange(st.args[0].start) && (!newName || st.obj === newName)));
+      for (const st of newSites) { st.file = file; sites.set(st.id, st); ids.add(st.id); }
+      result = {
+        ...result, declId: nd.id, name: newName || decl.name, opts: nd.opts || {}, line: lineOf(code, nd.start),
+        sites: newSites.filter((st) => !optIds.has(st.id)).map((st) => ({ kind: st.kind, id: st.id })),
+      };
+    } else {
+      result.lines = edits.length;
+    }
+    if (formatted && formatted !== code && remapAfterFormat(file, formatted)) code = formatted;
+    selfWrites.set(path.normalize(file), code);
+    fs.writeFileSync(file, code);
+    return result;
+  }
+
+  // ---------------------------------------------------------------- draw order
+  /**
+   * Changes the order in which an object is added to its parent, so it's drawn between `prev` and
+   * `next` (parent code sites of its new neighbours). Tries, in order: moving its line before next,
+   * after prev, or moving the neighbour's line instead (when nothing else is added in between).
+   */
+  async function orderObject(b) {
+    const site = sites.get(b.siteId);
+    if (!site) throw new Error("The line that adds this object to its parent wasn't found (reload the game).");
+    const file = site.file;
+    const original = fs.readFileSync(file, "utf8");
+    const rel = path.relative(root, file);
+    const kindOf = (st) => (st.form === "children" ? "element" : "stmt");
+    const tries = [];
+    const next = b.nextSiteId && sites.get(b.nextSiteId);
+    const prev = b.prevSiteId && sites.get(b.prevSiteId);
+    const same = (o) => o && o.file === file && kindOf(o) === kindOf(site);
+    if (same(next)) tries.push([site, next, "before"]);
+    if (same(prev)) tries.push([site, prev, "after"]);
+    if (same(next)) tries.push([next, site, "after", true]);
+    if (same(prev)) tries.push([prev, site, "before", true]);
+    if (!tries.length) return { ok: false, error: "Its new neighbours are added in another file or in another way, so the order can't be written." };
+    let plan = null, lastError = "";
+    for (const [mover, anchor, place, neighbourMoves] of tries) {
+      const r = moveEdits(original, mover.args[0].start, anchor.args[0].start, place, kindOf(site));
+      if (r.error) { lastError = r.error; continue; }
+      // Moving a neighbour is only right if no other object is added between the two lines.
+      const [lo, hi] = r.moved.start < r.anchor.start ? [r.moved.end, r.anchor.start] : [r.anchor.end, r.moved.start];
+      if (neighbourMoves && /\.addChild(At)?\(|\bchildren\s*:|\bparent\s*:/.test(original.slice(lo, hi))) { lastError = lastError || "other objects are added between them"; continue; }
+      plan = r;
+      break;
+    }
+    if (!plan) return { ok: false, error: `Can't change the order in the code: ${lastError || "other objects are added between them"} (${rel}).` };
+    let code = applyText(original, plan.edits);
+    const formatted = await formatLikeProject(file, original, code);
+    if (b.dryRun) return { ok: true, diffs: [{ file: rel, hunks: lineDiff(original, formatted || code) }] };
+
+    // Code sites inside the moved text move with it.
+    const ids = byFile.get(file) || new Set();
+    byFile.set(file, ids);
+    const { moved, removed, insert } = plan;
+    const carried = [];
+    for (const id of [...ids]) {
+      const st = sites.get(id), d = decls.get(id);
+      const pos = st ? st.args[0].start : d ? d.start : null;
+      if (pos == null || pos < moved.start || pos >= moved.end) continue;
+      carried.push(st || d);
+      ids.delete(id);
+    }
+    code = applyEdits(file, original, plan.edits.map((e) => ({ ...e })), { applied: [], inserted: [], saved: 0 });
+    // Where the moved text starts in the new code.
+    const removedLen = removed.end - removed.start;
+    const newStart = (insert.start >= removed.end ? insert.start - removedLen : insert.start) + insert.prefix;
+    const delta = newStart - moved.start;
+    const move = (r) => { if (r) { r.start += delta; r.end += delta; } };
+    for (const rec of carried) {
+      if (rec.args) { rec.args.forEach(move); move(rec.stmt); }
+      else { rec.start += delta; if (rec.end != null) rec.end += delta; if (rec.insertAt != null) rec.insertAt += delta; }
+      ids.add(rec.id);
+    }
+    if (formatted && formatted !== code && remapAfterFormat(file, formatted)) code = formatted;
+    selfWrites.set(path.normalize(file), code);
+    fs.writeFileSync(file, code);
+    return { ok: true, file: rel };
+  }
+
   /** Moves range `r` to account for an edit that replaced [ed.start, ed.end) with `delta` more chars. */
   function shiftRange(r, ed, delta) {
     const ins = ed.start === ed.end;
@@ -376,10 +540,13 @@ export default function pixiEditor() {
       }
       if (ed.decl) ed.decl.insertAt = ed.start + ed.text.length;
     }
-    // Refresh statement texts (used to verify removals later).
+    // Refresh the texts (used to detect changes made outside the editor), also for other ids that
+    // describe the same place.
     for (const id of ids) {
       const s = sites.get(id);
-      if (s && s.stmt) s.stmt.text = code.slice(s.stmt.start, s.stmt.end);
+      if (!s) continue;
+      for (const a of s.args) a.text = code.slice(a.start, a.end);
+      if (s.stmt) s.stmt.text = code.slice(s.stmt.start, s.stmt.end);
     }
     return code;
   }
@@ -499,19 +666,29 @@ export default function pixiEditor() {
     const out = instrumentCode(formatted, file, (p) => `tmp${p}${++n}`);
     if (!out) return false;
     const ids = [...(byFile.get(file) || [])];
-    const oldSites = ids.map((id) => sites.get(id)).filter(Boolean).sort((a, b) => a.args[0].start - b.args[0].start);
-    const oldDecls = ids.map((id) => decls.get(id)).filter(Boolean).sort((a, b) => a.start - b.start);
-    const newSites = [...out.sites].sort((a, b) => a.args[0].start - b.args[0].start);
-    const newDecls = [...out.decls].sort((a, b) => a.start - b.start);
+    // Several ids can describe the same place (kept across re-transforms): group them.
+    const group = (list, key, pos) => {
+      const map = new Map();
+      for (const x of list) { const k = key(x); if (!map.has(k)) map.set(k, []); map.get(k).push(x); }
+      return [...map.values()].sort((a, b) => pos(a[0]) - pos(b[0]));
+    };
+    const siteKey = (s) => `${s.kind}|${s.args.map((r) => `${r.start}-${r.end}`).join(",")}|${s.obj || ""}`;
+    const declKey = (d) => `${d.start}-${d.end}|${d.access || ""}`;
+    const oldSites = group(ids.map((id) => sites.get(id)).filter(Boolean), siteKey, (s) => s.args[0].start);
+    const oldDecls = group(ids.map((id) => decls.get(id)).filter(Boolean), declKey, (d) => d.start);
+    const newSites = group(out.sites, siteKey, (s) => s.args[0].start).map((g) => g[0]);
+    const newDecls = group(out.decls, declKey, (d) => d.start).map((g) => g[0]);
     if (oldSites.length !== newSites.length || oldDecls.length !== newDecls.length) return false;
-    if (oldSites.some((s, i) => s.kind !== newSites[i].kind || s.args.length !== newSites[i].args.length)) return false;
-    oldSites.forEach((s, i) => {
-      s.args = newSites[i].args;
-      s.stmt = newSites[i].stmt;
+    if (oldSites.some((g, i) => g[0].kind !== newSites[i].kind || g[0].args.length !== newSites[i].args.length)) return false;
+    oldSites.forEach((g, i) => {
+      for (const s of g) {
+        s.args = newSites[i].args.map((r) => ({ ...r }));
+        s.stmt = newSites[i].stmt && { ...newSites[i].stmt };
+      }
     });
-    oldDecls.forEach((d, i) => {
+    oldDecls.forEach((g, i) => {
       const nd = newDecls[i];
-      Object.assign(d, { start: nd.start, end: nd.end, insertAt: nd.insertAt, indent: nd.indent, scope: nd.scope });
+      for (const d of g) Object.assign(d, { start: nd.start, end: nd.end, insertAt: nd.insertAt, indent: nd.indent, scope: nd.scope && { ...nd.scope } });
     });
     return true;
   }
@@ -726,8 +903,17 @@ export default function pixiEditor() {
     return { error: `Unknown value type ${type}` };
   }
 
-  async function save(body) {
-    const result = { ok: true, saved: 0, applied: [], inserted: [], errors: [], files: [], failed: [] };
+  /** Applies edits to a string only (dry run: the registry of code sites is left untouched). */
+  const applyText = (code, edits) =>
+    [...edits].sort((a, b) => b.start - a.start || b.end - a.end).reduce((c, ed) => c.slice(0, ed.start) + ed.text + c.slice(ed.end), code);
+
+  /**
+   * Writes the editor's changes into the source files. With `dryRun`, nothing is written: returns
+   * `diffs` (per file, line hunks) so the editor can show what a save would change.
+   */
+  async function save(body, { dryRun = false } = {}) {
+    const result = { ok: true, saved: 0, applied: [], inserted: [], errors: [], files: [], failed: [], diffs: [] };
+    const apply = dryRun ? (file, code, edits) => applyText(code, edits) : applyEdits;
     const perFile = new Map();
     const bucket = (file) => {
       if (!perFile.has(file)) perFile.set(file, { siteEdits: [], inserts: [], names: new Set() });
@@ -777,10 +963,10 @@ export default function pixiEditor() {
       const { edits, errors } = planEdits(original, siteEdits, inserts, ctx);
       result.errors.push(...errors);
       if (!edits.length) continue;
-      let code = applyEdits(file, original, edits, result);
+      let code = apply(file, original, edits, result);
       if (ctx.pixiNames.size) {
         const imp = planImport(code, "pixi.js", [...ctx.pixiNames], { addOnly: true });
-        if (imp) code = applyEdits(file, code, [imp], { applied: [], inserted: [], saved: 0 });
+        if (imp) code = apply(file, code, [imp], { applied: [], inserted: [], saved: 0 });
       }
       // Second pass: keep the imports in sync with the components and behaviors the file uses.
       const touchesComponents = names.size || siteEdits.some((e) => e.remove);
@@ -788,20 +974,28 @@ export default function pixiEditor() {
         const scratch = { applied: [], inserted: [], saved: 0 };
         const builtin = [...names].filter((n) => !listBehaviors().some((bh) => bh.name === n));
         const imp = planImport(code, importSpec(file), builtin);
-        if (imp) code = applyEdits(file, code, [imp], scratch);
+        if (imp) code = apply(file, code, [imp], scratch);
         for (const bh of listBehaviors()) {
           const bimp = planImport(code, behaviorSpec(file, bh.file), names.has(bh.name) ? [bh.name] : []);
-          if (bimp) code = applyEdits(file, code, [bimp], scratch);
+          if (bimp) code = apply(file, code, [bimp], scratch);
         }
         if (names.size) needsModule = true;
       }
       const formatted = await formatLikeProject(file, original, code);
+      if (dryRun) {
+        result.diffs.push({ file: path.relative(root, file), hunks: lineDiff(original, formatted || code) });
+        continue;
+      }
       if (formatted && formatted !== code && remapAfterFormat(file, formatted)) code = formatted;
       selfWrites.set(path.normalize(file), code);
       fs.writeFileSync(file, code);
       result.files.push(path.relative(root, file));
     }
 
+    if (dryRun) {
+      if (needsModule && !fs.existsSync(componentsFile())) result.newFiles = [path.relative(root, componentsFile())];
+      return result;
+    }
     if (needsModule && (await ensureComponentsModule())) {
       result.files.push(path.relative(root, componentsFile()));
       result.createdModule = true;
@@ -842,8 +1036,8 @@ export default function pixiEditor() {
       if (!/\.(m?[jt]sx?)$/.test(file) || file.includes("/node_modules/") || !file.startsWith(root)) return null;
       if (file.startsWith(path.resolve(HERE, ".."))) return null;
       const out = instrument(code, file, nextId);
-      if (!out) { register(file, [], []); return null; }
-      register(file, out.sites, out.decls);
+      if (!out) { register(file, [], [], code); return null; }
+      register(file, out.sites, out.decls, code);
       return { code: out.code, map: out.map };
     },
 
@@ -897,6 +1091,27 @@ export default function pixiEditor() {
           readJson().then(async (b) => {
             try { sendJson({ ok: true, ...(await createBehavior(b.name, b.objectName)) }); }
             catch (err) { sendJson({ ok: false, error: String(err.message || err) }); }
+          });
+          return;
+        }
+        if (url.pathname === `${BASE}api/order` && req.method === "POST") {
+          readJson().then(async (b) => {
+            try { sendJson(await orderObject(b)); }
+            catch (err) { sendJson({ ok: false, error: String(err.message || err) }); }
+          });
+          return;
+        }
+        if (url.pathname === `${BASE}api/object` && req.method === "POST") {
+          readJson().then(async (b) => {
+            try { sendJson(await objectAction(b)); }
+            catch (err) { sendJson({ ok: false, error: String(err.message || err) }); }
+          });
+          return;
+        }
+        if (url.pathname === `${BASE}api/preview` && req.method === "POST") {
+          readJson().then(async (b) => {
+            try { sendJson(await save(b, { dryRun: true })); }
+            catch (err) { sendJson({ ok: false, errors: [String((err && err.message) || err)], diffs: [] }); }
           });
           return;
         }

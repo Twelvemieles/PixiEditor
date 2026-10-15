@@ -1,7 +1,8 @@
 // Quick tests for the instrumenter and the source rewriter: `npm test`
 import assert from "node:assert/strict";
 import { instrument } from "../src/instrument.js";
-import { applyDelta, planEdits, planImport, serializeParams, literalValue } from "../src/writeback.js";
+import { analyzeObject, deleteEdits, duplicateEdits, pruneImports, namesIn, moveEdits } from "../src/refactor.js";
+import { applyDelta, planEdits, planImport, serializeParams, literalValue, lineDiff } from "../src/writeback.js";
 
 const cases = [
   ["22", 18, "40"],
@@ -114,6 +115,70 @@ coin.texture = Texture.from("gem");
   assert.match(out.code, /children: \[__pixiEditor\$\.s\(coin, "parent:children", "s\d+"\)\]/);
   const block = instrument("function f() {\n  const a = new Container();\n}\n", "/b.ts", (p) => p + ++k);
   assert.deepEqual(block.decls[0].scope, { start: 13, end: 45 });
+}
+
+// --- lines inside pointer handlers are marked transient
+{
+  let k = 0;
+  const src = `const b = createSprite({ texture: "a", events: { pointerover: (sp) => { sp.texture = Texture.from("b"); } } });
+b.on("pointerdown", () => b.scale.set(0.9));
+b.on("added", () => b.scale.set(2));
+items.forEach((it) => it.position.set(1, 2));
+`;
+  const out = instrument(src, "/h.ts", (p) => p + ++k);
+  const t = (kind, form) => out.sites.filter((s) => s.kind === kind && (!form || s.form === form)).map((s) => !!s.transient);
+  assert.deepEqual(t("texture", "assign"), [true]);
+  assert.deepEqual(t("scale"), [true, false]);
+  assert.deepEqual(t("position"), [false]);
+  assert.match(out.code, /__pixiEditor\$\.s\(sp, "texture", "s\d+", 1\)/);
+}
+
+// --- line diff for the save preview
+{
+  const a = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk";
+  const b = "a\nb\nC\nd\ne\nf\ng\nh\ni\nj\nk\nl";
+  const h = lineDiff(a, b);
+  assert.equal(h.length, 2);
+  assert.deepEqual(h[0].lines.map((l) => l.t + l.s).join(","), " a, b,-c,+C, d, e");
+  assert.equal(h[1].oldStart, 10);
+  assert.equal(h[1].lines.map((l) => l.t + l.s).join(","), " j, k,+l");
+  assert.deepEqual(lineDiff("x", "x"), []);
+}
+
+// --- delete, duplicate and move objects' code
+{
+  const apply = (code, edits) => [...edits].sort((a, b) => b.start - a.start).reduce((c, e) => c.slice(0, e.start) + e.text + c.slice(e.end), code);
+  const code = `import { Container, Sprite, Text } from "pixi.js";
+export function f(hud: Container) {
+  const coin = Sprite.from("coin");
+  coin.anchor.set(0.5);
+  hud.addChild(coin);
+  const label = new Text({ text: "x" });
+  const group = createContainer({ children: [label, coin] });
+  return group;
+}
+`;
+  const at = (t) => ({ start: code.indexOf(t), end: code.indexOf(t) + t.length });
+  const a = analyzeObject(code, { ...at('Sprite.from("coin")'), access: "coin" });
+  assert.ok(a.ok);
+  const edits = deleteEdits(code, a);
+  let del = apply(code, edits);
+  del = apply(del, pruneImports(del, namesIn(edits.map((e) => code.slice(e.start, e.end)).join("\n"))));
+  assert.ok(!/coin/.test(del) && /import \{ Container, Text \} from "pixi.js";/.test(del) && /children: \[label\]/.test(del), del);
+  const dup = apply(code, duplicateEdits(code, a, "coin", "coin2").edits);
+  assert.match(dup, /hud\.addChild\(coin\);\n  const coin2 = Sprite\.from\("coin"\);\n  coin2\.anchor\.set\(0\.5\);\n  hud\.addChild\(coin2\);/);
+  assert.match(dup, /children: \[label, coin, coin2\]/);
+  // used by other code: delete is refused, with the line
+  const b = analyzeObject(code, { ...at('new Text({ text: "x" })'), access: "label" });
+  assert.ok(b.ok); // only a list entry
+  const g = analyzeObject(code, { ...at("createContainer({ children: [label, coin] })"), access: "group" });
+  assert.ok(!g.ok && g.blockers[0].line === 8);
+  // draw order: move a line, refuse to use a variable before it exists
+  const mv = moveEdits(code, code.indexOf("hud.addChild(coin)"), code.indexOf("const label"), "after");
+  assert.match(apply(code, mv.edits), /const label = new Text\(\{ text: "x" \}\);\n  hud\.addChild\(coin\);/);
+  assert.match(moveEdits(code, code.indexOf("hud.addChild(coin)"), code.indexOf("const coin"), "before").error, /declared later/);
+  const el = moveEdits(code, code.indexOf("coin]"), code.indexOf("label, coin"), "before", "element");
+  assert.match(apply(code, el.edits), /children: \[coin, label\]/);
 }
 
 console.log("OK — all tests pass");

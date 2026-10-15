@@ -45,13 +45,14 @@ as usual.
 | **Select** | Click selects the top-most object. **Alt+click** cycles through the objects stacked under the pointer. Pressing inside the current selection drags it even if something is on top. |
 | **Move tool (V)** | Drag to move (Shift = one axis), corner handles scale (Shift = free X/Y), the round handle above rotates (Shift = 15° steps). Arrow keys = 1 px (Shift = 10 px). |
 | **Pivot tool (P)** | Drag inside the object to place its origin — `anchor` for sprites/texts, `pivot` for everything else. The object stays in place (its position is compensated). Shift snaps to corners/edges/center. |
-| **Hierarchy** | The scene tree. A pink dot means the object is linked to a line of code. Double-click to rename. **Drag a row onto a container to move the object into it** (it stays in the same place on screen). The eye hides an object while editing (e.g. a popup covering the screen) — this is never saved. |
+| **Hierarchy** | The scene tree. A pink dot means the object is linked to a line of code. **Find** (`Cmd/Ctrl+F`) filters it by name or type; Enter jumps through the matches. Double-click to rename. **Drag a row onto a container** to move the object into it (it stays in the same place on screen), or onto the **top/bottom edge** of a row to draw it before/after that object. The eye hides an object while editing (e.g. a popup covering the screen) — this is never saved. |
 | **Inspector** | Name (saved as the object's `label`), position, scale, rotation, alpha, pivot/anchor with a 3×3 origin grid, and **Appearance**: texture of a sprite, skeleton of a spine, tint, text, text color and shape fill colors. Drag a field's label to scrub the value, like in Unity. Below, the lines of code that control the object. |
 | **Zoom / pan** | Mouse wheel or pinch zooms around the pointer; Space+drag or middle-drag pans. `F` fits the game, `0` resets to 100%. |
+| **Duplicate / Delete** | `Cmd/Ctrl+D` or ⧉ copies the object's code; `Delete` or 🗑 removes it (with a preview of the lines). See [Duplicating and deleting](#duplicating-and-deleting). |
 | **Create** | **+ Create** in the hierarchy: Container, Sprite (pick one of the textures the game has loaded), Text, Rectangle or Circle. See [Creating objects](#creating-objects). |
 | **Components** | "Add component…" in the inspector: **Anchor**, **Button**, **Tween**, or your own **behaviors** (see below). |
 | **Code** | Every line that controls the selected object is listed in the inspector; **Open ↗** (or double-click) opens it in VS Code at that line. |
-| **Save** | `Cmd/Ctrl+S`. Undo `Cmd/Ctrl+Z`, redo `Cmd/Ctrl+Shift+Z`. |
+| **Save** | `Cmd/Ctrl+S` opens **Review changes**: every change (with **Discard**) and the exact lines that will change in each file. Enter saves. Untick "Review before saving" to save directly. Undo `Cmd/Ctrl+Z`, redo `Cmd/Ctrl+Shift+Z`. |
 | **Quit** | The **Quit** button stops the editor process cleanly (closes the project's Vite and frees the ports). Ctrl+C in the terminal does the same. If an old editor is still running on the port, a new launch closes it first. |
 
 ## Creating objects
@@ -74,6 +75,41 @@ leaderboard.addChild(coin);
 From then on it is a normal object: move, rename, recolor or add components to it and save as usual.
 The container must be stored in a variable in the code. Variable names never clash with existing
 ones (`label`, `label2`…), and the project's quote style and Prettier formatting are respected.
+
+## Duplicating and deleting
+
+**Duplicate** (`Cmd/Ctrl+D`) copies the object's code right after the original — its declaration and
+the lines next to it that set it up — with a new variable name, and adds the copy wherever the
+original is listed:
+
+```ts
+const coin = Sprite.from("coin");        const coin2 = Sprite.from("coin");
+coin.anchor.set(0.5);              ->     coin2.anchor.set(0.5);
+hud.addChild(coin);                       hud.addChild(coin2);
+createContainer({ children: [coin] })     createContainer({ children: [coin, coin2] })
+```
+
+The copy appears on top of the original, selected, ready to be dragged. Save the original's changes
+first. Containers whose children are added in the code are not duplicated (duplicate the children).
+
+**Delete** (`Delete` key) shows the lines that will be removed and asks first. It removes the
+declaration, every line that uses the object as its subject (`coin.x = …`, `coin.on(…)`,
+`hud.addChild(coin)`, `addComponent(coin, …)`), its entry in `children: [...]` lists, and imports that
+become unused. If other code still needs the object (`return { coin }`, `if (coin.visible)`,
+`foo(coin)`), nothing is deleted and the editor shows those lines.
+
+## Draw order
+
+Drag an object onto the top or bottom edge of another one in the hierarchy. On save, the line that
+adds it moves (`hud.addChild(a)` after `hud.addChild(b)`, or `children: [b, a]`). When that line
+can't move because it would use a variable before it's declared, the neighbour's line moves
+instead; if neither works, the editor says why and puts the order back.
+
+## Lines inside pointer handlers
+
+Lines inside hover/press handlers (`events: { pointerover: … }`, `obj.on("pointerdown", …)`) are
+marked **on pointer** in the inspector. They never replace the object's setup line: dragging a button
+after hovering it in Play mode still changes its normal position and texture, not the hover state.
 
 ## Changing the parent, the texture or the spine
 
@@ -98,8 +134,8 @@ editor finds the constant whose value is that texture's key).
 **Spine.** Select a spine → Appearance → Spine → **Change…** and pick a loaded skeleton (paired with
 the atlas of the same name). The preview plays the same animation if the new skeleton has it, and
 warns you if it doesn't (the code that plays it will need another name). On save,
-`SPINES.JP_BAR.SKEL` / `SPINES.JP_BAR.ATLAS` become `SPINES.DRACULA.SKEL` / `SPINES.DRACULA.ATLAS`;
-press **Reload** to run the game with it. A spine chosen by an expression
+`SPINES.JP_BAR.SKEL` / `SPINES.JP_BAR.ATLAS` become `SPINES.DRACULA.SKEL` / `SPINES.DRACULA.ATLAS`,
+and the game reloads by itself to run with it. A spine chosen by an expression
 (`SPINES[options.key].SKEL`) can't be changed from the editor — the inspector says so.
 
 ## Components
@@ -212,6 +248,7 @@ src/plugin.js        Vite plugin: instruments code, injects the runtime, saves c
 src/instrument.js    Parses code (Babel) and marks the code site of each property
 src/writeback.js     Computes text edits ("adjust only the number")
 src/runtime.js       Injected into the game: links objects to lines of code
+src/refactor.js      Deleting, duplicating and reordering an object's code
 templates/           pixi-components.ts (copied into projects that use components) and behavior.ts
 editor/              UI (dependency-free HTML/CSS/JS)
 test/run.js          npm test
@@ -219,6 +256,8 @@ test/run.js          npm test
 
 ## Next steps
 
+- Spine animation picker (preview animations, rename the one the code plays).
 - Multi-selection and alignment tools.
+- Screen size presets to test layouts.
 - More components (e.g. layout with `@pixi/layout`, sprite animation, sound on click).
 - Font, size and other text style properties.

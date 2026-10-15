@@ -23,7 +23,7 @@
 
   globalThis.__PIXI_EDITOR__ = {
     // Code site that sets a property: returns the same object.
-    s: function (o, kind, id) {
+    s: function (o, kind, id, transient) {
       if (isDisplay(o) && kind === "parent:children") {
         // createContainer({ children: [o] }): the helper adds it later with its own addChild(),
         // so the list entry is applied again when the container is created (see d).
@@ -34,8 +34,11 @@
       } else if (isDisplay(o)) {
         var mm = m(o);
         var prev = mm.sites[kind];
+        // `transient`: a line inside a pointer handler (hover/press state). It never replaces the
+        // object's own setup line for that property.
+        if (transient && prev && !prev.transient) return o;
         if (!prev || prev.id !== id) use(id);
-        mm.sites[kind] = { id: id, seq: ++seq };
+        mm.sites[kind] = transient ? { id: id, seq: ++seq, transient: true } : { id: id, seq: ++seq };
       }
       return o;
     },

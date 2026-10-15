@@ -50,6 +50,10 @@
           </div>
         </div>
       </div>
+      <div class="tree-search">
+        <input id="tree-search" type="text" placeholder="Find object…  ⌘F" spellcheck="false" />
+        <span id="tree-count"></span>
+      </div>
       <div class="tree" id="tree"></div>
     </section>
 
@@ -92,6 +96,25 @@
     </section>
   </main>
 
+  <div class="modal hidden" id="review-modal">
+    <div class="modal-card review-card">
+      <div class="modal-head">
+        <b id="review-title">Review changes</b>
+        <span class="review-sub" id="review-sub"></span>
+      </div>
+      <div class="review-body">
+        <div class="review-changes" id="review-changes"></div>
+        <div class="review-diff" id="review-diff"></div>
+      </div>
+      <div class="review-foot">
+        <label class="review-toggle"><input type="checkbox" id="review-toggle" checked /> Review before saving</label>
+        <span class="spacer"></span>
+        <button class="ghost" id="review-cancel">Keep editing</button>
+        <button class="primary" id="review-save">Save to code</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal hidden" id="texture-modal">
     <div class="modal-card">
       <div class="modal-head">
@@ -104,7 +127,7 @@
     </div>
   </div>
 
-  <footer class="statusbar"><span id="status">Ready</span><span id="hint">Ctrl/Cmd+E edit/play · V move · P pivot · Alt+click = object below · wheel zooms · Space+drag pans · F fits</span></footer>
+  <footer class="statusbar"><span id="status">Ready</span><span id="hint">Ctrl/Cmd+E edit/play · V move · P pivot · Ctrl/Cmd+F find · Ctrl/Cmd+D duplicate · Del delete · Alt+click = object below · Space+drag pans · F fits</span></footer>
 
   <script type="module" src="/__pixi-editor/editor.js"></script>
 </body>
