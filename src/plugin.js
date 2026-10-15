@@ -21,6 +21,10 @@ const PREVIEW_QUERY = "?pixi-editor-preview";
 // The project's own pixi.js, for the editor UI (textures list, creating objects live).
 const PIXI_URL = "/@pixi-editor/pixi.ts";
 const PIXI_ID = "__pixi_editor_pixi.ts?pixi-editor-pixi";
+// The project's Spine runtime (if any), for previewing skeletons from the Project panel.
+const SPINE_URL = "/@pixi-editor/spine.ts";
+const SPINE_ID = "__pixi_editor_spine.ts?pixi-editor-spine";
+const SPINE_PACKAGES = ["@esotericsoftware/spine-pixi-v8", "@esotericsoftware/spine-pixi"];
 const BASE = "/__pixi-editor/";
 const EDITOR_DIRS = ["src", "templates", "editor", "bin"].map((d) => path.resolve(HERE, "..", d));
 
@@ -1023,11 +1027,24 @@ export default function pixiEditor() {
     resolveId(id) {
       if (id === PREVIEW_URL) return componentsFile() + PREVIEW_QUERY;
       if (id === PIXI_URL) return path.join(root, PIXI_ID);
+      if (id === SPINE_URL) return path.join(root, SPINE_ID);
       return null;
     },
     load(id) {
       if (id === componentsFile() + PREVIEW_QUERY) return fs.readFileSync(TEMPLATE, "utf8");
       if (id === path.join(root, PIXI_ID)) return 'export * from "pixi.js";\n';
+      if (id === path.join(root, SPINE_ID)) {
+        const req = createRequire(path.join(root, "package.json"));
+        const installed = (name) => {
+          for (const spec of [name, `${name}/package.json`]) { try { req.resolve(spec); return true; } catch { /* ESM-only exports */ } }
+          for (let dir = root; ; dir = path.dirname(dir)) {
+            if (fs.existsSync(path.join(dir, "node_modules", name, "package.json"))) return true;
+            if (path.dirname(dir) === dir) return false;
+          }
+        };
+        const pkg = SPINE_PACKAGES.find(installed);
+        return pkg ? `export * from ${JSON.stringify(pkg)};\nexport const available = true;\n` : "export const available = false;\n";
+      }
       return null;
     },
 

@@ -21,6 +21,63 @@
   }
   function use(id) { siteUse.set(id, (siteUse.get(id) || 0) + 1); }
 
+  // ---- Game audio mute (the editor's own sounds are not affected).
+  // WebAudio: everything the game connects to a context's speakers goes through one gain node per
+  // context. Media elements (<audio>, new Audio()) are muted directly.
+  var muted = false;
+  // The editor page (same origin) remembers the choice: start muted before the game makes a sound.
+  try { muted = window.parent !== window && window.parent.localStorage.getItem("pixi-editor:muted") === "1"; } catch (e) { /* no storage */ }
+  var masters = [];
+  var mediaEls = typeof Set !== "undefined" ? new Set() : null;
+  function masterFor(ctx) {
+    for (var i = 0; i < masters.length; i++) if (masters[i].ctx === ctx) return masters[i].gain;
+    var gain = origCreateGain.call(ctx);
+    gain.gain.value = muted ? 0 : 1;
+    origConnect.call(gain, ctx.destination);
+    masters.push({ ctx: ctx, gain: gain });
+    return gain;
+  }
+  var AN = typeof AudioNode !== "undefined" ? AudioNode.prototype : null;
+  var BAC = typeof BaseAudioContext !== "undefined" ? BaseAudioContext.prototype : typeof AudioContext !== "undefined" ? AudioContext.prototype : null;
+  var origConnect = AN && AN.connect;
+  var origDisconnect = AN && AN.disconnect;
+  var origCreateGain = BAC && BAC.createGain;
+  if (AN && origConnect && origCreateGain) {
+    AN.connect = function (target) {
+      if (target && typeof AudioDestinationNode !== "undefined" && target instanceof AudioDestinationNode && !(typeof OfflineAudioContext !== "undefined" && target.context instanceof OfflineAudioContext)) {
+        var args = Array.prototype.slice.call(arguments);
+        args[0] = masterFor(target.context);
+        return origConnect.apply(this, args);
+      }
+      return origConnect.apply(this, arguments);
+    };
+    AN.disconnect = function (target) {
+      if (target && typeof AudioDestinationNode !== "undefined" && target instanceof AudioDestinationNode) {
+        var args = Array.prototype.slice.call(arguments);
+        args[0] = masterFor(target.context);
+        try { return origDisconnect.apply(this, args); } catch (e) { return undefined; }
+      }
+      return origDisconnect.apply(this, arguments);
+    };
+  }
+  if (typeof HTMLMediaElement !== "undefined") {
+    var origPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function () {
+      if (mediaEls) mediaEls.add(this);
+      if (muted) this.muted = true;
+      return origPlay.apply(this, arguments);
+    };
+  }
+  function setMuted(on) {
+    muted = !!on;
+    for (var i = 0; i < masters.length; i++) masters[i].gain.gain.value = muted ? 0 : 1;
+    if (mediaEls) mediaEls.forEach(function (el) { el.muted = muted; });
+    if (typeof document !== "undefined") {
+      var els = document.querySelectorAll("audio, video");
+      for (var j = 0; j < els.length; j++) els[j].muted = muted;
+    }
+  }
+
   globalThis.__PIXI_EDITOR__ = {
     // Code site that sets a property: returns the same object.
     s: function (o, kind, id, transient) {
@@ -76,5 +133,7 @@
     // Set by the editor while in Edit mode; components pause their animations.
     paused: false,
     nextSeq: function () { return ++seq; },
+    setMuted: setMuted,
+    isMuted: function () { return muted; },
   };
 })();

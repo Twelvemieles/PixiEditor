@@ -46,8 +46,11 @@ as usual.
 | **Move tool (V)** | Drag to move (Shift = one axis), corner handles scale (Shift = free X/Y), the round handle above rotates (Shift = 15° steps). Arrow keys = 1 px (Shift = 10 px). |
 | **Pivot tool (P)** | Drag inside the object to place its origin — `anchor` for sprites/texts, `pivot` for everything else. The object stays in place (its position is compensated). Shift snaps to corners/edges/center. |
 | **Hierarchy** | The scene tree. A pink dot means the object is linked to a line of code. **Find** (`Cmd/Ctrl+F`) filters it by name or type; Enter jumps through the matches. Double-click to rename. **Drag a row onto a container** to move the object into it (it stays in the same place on screen), or onto the **top/bottom edge** of a row to draw it before/after that object. The eye hides an object while editing (e.g. a popup covering the screen) — this is never saved. |
+| **Project** | Below the hierarchy: the project's files (without `node_modules`, `dist` or hidden files). Click a folder to open it, a file to see it in the inspector (see [Previewing files](#previewing-files)), double-click to open it in VS Code. "Find file…" searches the whole project. The file that creates the selected object is marked in pink. Click **Project** to collapse the panel. |
+| **Panels** | Drag the lines between the panels to resize them (left column, inspector, and hierarchy vs. files); double-click a line to reset it. Sizes are remembered. |
 | **Inspector** | Name (saved as the object's `label`), position, scale, rotation, alpha, pivot/anchor with a 3×3 origin grid, and **Appearance**: texture of a sprite, skeleton and animation of a spine, tint, text, text color, font, size, weight, style, alignment, letter spacing and shape fill colors. Drag a field's label to scrub the value, like in Unity. Below, the lines of code that control the object. |
 | **Zoom / pan** | Mouse wheel or pinch zooms around the pointer; Space+drag or middle-drag pans. `F` fits the game, `0` resets to 100%. |
+| **Mute** | The speaker button next to the zoom (or `M`) mutes the game only — sound previews in the inspector still play. It is remembered, and applied before the game starts. |
 | **Screen size** | The menu next to the zoom (bottom right) gives the game a phone, tablet, laptop or custom size, to test the layout (and the Anchor component) at other resolutions. Games with a fixed canvas size keep their size. |
 | **Duplicate / Delete** | `Cmd/Ctrl+D` or ⧉ copies the object's code; `Delete` or 🗑 removes it (with a preview of the lines). See [Duplicating and deleting](#duplicating-and-deleting). |
 | **Create** | **+ Create** in the hierarchy: Container, Sprite (pick one of the textures the game has loaded), Text, Rectangle or Circle. See [Creating objects](#creating-objects). |
@@ -76,6 +79,21 @@ leaderboard.addChild(coin);
 From then on it is a normal object: move, rename, recolor or add components to it and save as usual.
 The container must be stored in a variable in the code. Variable names never clash with existing
 ones (`label`, `label2`…), and the project's quote style and Prettier formatting are respected.
+
+## Previewing files
+
+Click a file in **Project** and the inspector shows it:
+
+- **Code and text** (`.ts`, `.js`, `.json`, `.atlas`, `.fnt`, `.md`…): colored, with line numbers.
+  Double-click a line to open the file at that line. Minified JSON gets a **Format** button.
+- **Images**: full size or fitted, on a checker, dark or light background, with their dimensions.
+- **Sounds**: player with waveform (click to seek), loop and volume. Space plays/pauses.
+- **Spine**: select the `.atlas` (or the skeleton `.json`/`.skel` next to it) to see the skeleton
+  animated. Click an animation to play it; pause, loop, speed (0.25×–2×), skins and background. It uses
+  the game's own Pixi and Spine runtime, and the files the game already loaded when possible.
+
+Selecting an object in the scene or the hierarchy brings the object inspector back. Widen the
+inspector (drag its left edge) to read long lines.
 
 ## Text style and spine animation
 

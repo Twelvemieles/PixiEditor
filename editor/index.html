@@ -36,7 +36,8 @@
     </div>
   </header>
 
-  <main class="layout">
+  <main class="layout" id="layout">
+    <aside class="side" id="left-side">
     <section class="panel" id="hierarchy-panel">
       <div class="panel-title with-action">Hierarchy
         <div class="create">
@@ -56,6 +57,19 @@
       </div>
       <div class="tree" id="tree"></div>
     </section>
+    <div class="splitter h" data-split="files" title="Drag to resize · double-click to reset"></div>
+    <section class="panel" id="files-panel">
+      <div class="panel-title with-action">
+        <button class="files-toggle" id="files-toggle" title="Show / hide the project files"><span class="chev">▾</span> Project</button>
+        <button class="ghost tiny" id="files-refresh" title="Refresh">⟳</button>
+      </div>
+      <div class="tree-search">
+        <input id="files-search" type="text" placeholder="Find file…" spellcheck="false" />
+      </div>
+      <div class="files" id="files"></div>
+    </section>
+    </aside>
+    <div class="splitter v" data-split="left" title="Drag to resize · double-click to reset"></div>
 
     <section class="viewport" id="viewport">
       <iframe id="game" title="Game"></iframe>
@@ -70,6 +84,10 @@
         </button>
       </div>
       <div class="zoom" id="zoom">
+        <button id="btn-mute" class="mute" title="Mute the game (M) — the editor's own previews still play">
+          <svg class="on" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6h2.5l3.5-3v10l-3.5-3h-2.5z" fill="currentColor"/><path d="M11 5.5a3.5 3.5 0 0 1 0 5M12.8 3.8a6 6 0 0 1 0 8.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+          <svg class="off" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6h2.5l3.5-3v10l-3.5-3h-2.5z" fill="currentColor"/><path d="M11 6l4 4M15 6l-4 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        </button>
         <select id="screen-size" title="Screen size: test the layout at other resolutions">
           <option value="">Window</option>
           <option value="390x844">Phone · 390×844</option>
@@ -99,6 +117,7 @@
       </div>
     </section>
 
+    <div class="splitter v" data-split="right" title="Drag to resize · double-click to reset"></div>
     <section class="panel" id="inspector-panel">
       <div class="panel-title">Inspector</div>
       <div id="inspector" class="inspector">

@@ -14,7 +14,49 @@ import pixiEditor from "./plugin.js";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDITOR_DIR = path.resolve(HERE, "../editor");
 const BASE = "/__pixi-editor/";
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" };
+const MIME = {
+  ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png",
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".avif": "image/avif",
+  ".json": "application/json", ".txt": "text/plain", ".md": "text/plain", ".atlas": "text/plain",
+  ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+};
+// Never listed in the project explorer.
+const HIDDEN_DIRS = new Set(["node_modules", ".git", "dist", "build", ".vite", ".cache", ".tmp", "coverage"]);
+
+/** Resolves a project-relative path, refusing anything outside the project. */
+function projectPath(root, rel) {
+  const abs = path.resolve(root, String(rel || "").replace(/^[/\\]+/, ""));
+  return abs === root || abs.startsWith(root + path.sep) ? abs : null;
+}
+const toRel = (root, abs) => path.relative(root, abs).split(path.sep).join("/");
+function listDir(root, dir) {
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter((e) => !e.name.startsWith(".") && !(e.isDirectory() && HIDDEN_DIRS.has(e.name)))
+    .map((e) => {
+      const abs = path.join(dir, e.name);
+      const isDir = e.isDirectory();
+      let size = 0;
+      if (!isDir) { try { size = fs.statSync(abs).size; } catch { /* broken link */ } }
+      return { name: e.name, path: toRel(root, abs), type: isDir ? "dir" : "file", size };
+    })
+    .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name, undefined, { numeric: true }) : a.type === "dir" ? -1 : 1));
+}
+/** Files whose path contains `q` (case-insensitive), up to `limit`. */
+function findFiles(root, q, limit = 300) {
+  const out = [];
+  const needle = q.toLowerCase();
+  (function walk(dir) {
+    if (out.length >= limit) return;
+    let entries = [];
+    try { entries = listDir(root, dir); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= limit) return;
+      if (e.type === "dir") walk(path.join(root, e.path));
+      else if (e.path.toLowerCase().includes(needle)) out.push(e);
+    }
+  })(root);
+  return out;
+}
 const CONFIG_DIR = path.join(os.homedir(), ".pixi-editor");
 const RECENT_FILE = path.join(CONFIG_DIR, "recent.json");
 const MAX_RECENT = 12;
@@ -224,6 +266,28 @@ export async function startEditor({ port = 5180, project = null, open = true } =
       } catch (err) {
         return json(res, 200, { ok: false, error: String(err.message || err) });
       }
+    }
+
+    // Project explorer: list folders, search files, serve a file for previews.
+    if (p === `${BASE}api/files` || p === `${BASE}api/file`) {
+      await switching;
+      if (!current) return json(res, 200, { error: "No project open" });
+      const root = current.path;
+      if (p === `${BASE}api/files`) {
+        const q = (url.searchParams.get("q") || "").trim();
+        if (q) return json(res, 200, { root: current.name, entries: findFiles(root, q) });
+        const dir = projectPath(root, url.searchParams.get("dir"));
+        if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return json(res, 200, { error: "Folder not found" });
+        return json(res, 200, { root: current.name, entries: listDir(root, dir) });
+      }
+      const file = projectPath(root, url.searchParams.get("path"));
+      if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile() || fs.statSync(file).size > 20e6) {
+        res.statusCode = 404;
+        return res.end("Not found");
+      }
+      res.setHeader("Content-Type", MIME[path.extname(file).toLowerCase()] || "application/octet-stream");
+      res.setHeader("Cache-Control", "no-store");
+      return res.end(fs.readFileSync(file));
     }
 
     // Editor UI (static files).

@@ -287,6 +287,7 @@ iframe.addEventListener("load", () => {
       win.addEventListener("keydown", onKey, true);
       setMode(state.mode);
       if (iframe.classList.contains("sized")) setTimeout(zoomFit, 300); // a screen size preset: show all of it
+      applyMute();
       if (state.afterReload) { setStatus(state.afterReload, "ok"); state.afterReload = null; }
       else setStatus(`Connected to ${state.project ? state.project.name : "the game"} — the game is running. Press Edit (Ctrl/Cmd+E) to select objects.`);
       loadComponents();
@@ -1356,6 +1357,7 @@ function onKey(e) {
   if (!mod && (e.key === "v" || e.key === "V")) { setTool("move"); return; }
   if (!mod && (e.key === "p" || e.key === "P")) { setTool("pivot"); return; }
   if (!mod && e.key === "0") { zoomReset(); return; }
+  if (!mod && (e.key === "m" || e.key === "M")) { muteBtn.click(); return; }
   if (!mod && (e.key === "+" || e.key === "=")) { zoomBy(1.25); return; }
   if (!mod && (e.key === "-" || e.key === "_")) { zoomBy(1 / 1.25); return; }
   const sel = state.selected;
@@ -1378,6 +1380,8 @@ window.addEventListener("beforeunload", (e) => { if (pendingCount() && !state.st
 function select(o) {
   if (state.selected === o) return;
   state.selected = o;
+  if (o) { state.fileView = null; for (const r of document.querySelectorAll("#files .file.selected")) r.classList.remove("selected"); filesState.selected = null; }
+  markLinkedFile(o);
   if (o) { let p = o.parent; while (p) { state.expanded.add(p); p = p.parent; } }
   renderTree(true); // rebuilds only if expanding changed the tree; otherwise just moves the highlight
   renderInspector();
@@ -1793,6 +1797,8 @@ function textRow(o) {
 
 function renderInspector() {
   const o = state.selected;
+  if (state.previewCleanup) { state.previewCleanup(); state.previewCleanup = null; }
+  if (!o && state.fileView) { renderFileView(state.fileView); return; }
   if (!o) { inspectorEl.innerHTML = `<p class="empty">Select an object in the scene or in the hierarchy.</p>`; return; }
   inspectorEl.innerHTML = "";
 
@@ -2240,6 +2246,13 @@ function showProject(project, reloadGame = true) {
   projectInput.title = project.path;
   document.title = `Pixi Editor — ${project.name}`;
   welcome.classList.add("hidden");
+  if (changed) {
+    filesState.expanded = new Set([""]);
+    filesState.cache.clear();
+    filesState.selected = filesState.linked = null;
+    state.fileView = null;
+    renderFiles();
+  }
   if (changed || reloadGame) {
     state.expanded = new WeakSet();
     select(null);
@@ -2781,7 +2794,10 @@ function reparent(o, target, quiet = false) {
 }
 
 // Small hook for automated tests (Playwright): select an object of the game.
-window.pixiEditor = { select: (o) => select(o) };
+window.pixiEditor = {
+  select: (o) => select(o),
+  openFile: (p, size = 0) => openFileView({ name: p.split("/").pop(), path: p, size, type: "file" }),
+};
 
 
 // ---------------------------------------------------------------- delete and duplicate
@@ -3012,3 +3028,629 @@ screenSelect.onchange = () => {
   applyScreen(v);
 };
 try { const saved = localStorage.getItem(SCREEN_KEY); if (saved) applyScreen(saved, false); } catch { /* private mode */ }
+
+// ---------------------------------------------------------------- resizable panels
+const LAYOUT_KEY = "pixi-editor:layout";
+const layoutEl = $("#layout");
+const LAYOUT_DEFAULT = { left: 260, right: 300, files: 220, filesCollapsed: false };
+let layout = { ...LAYOUT_DEFAULT };
+try { layout = { ...layout, ...JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}") }; } catch { /* private mode */ }
+function applyLayout(saveIt = true) {
+  const W = window.innerWidth;
+  layout.left = Math.round(Math.min(Math.max(layout.left, 180), Math.max(180, W * 0.45)));
+  layout.right = Math.round(Math.min(Math.max(layout.right, 240), Math.max(240, W * 0.45)));
+  const colH = $("#left-side").clientHeight || window.innerHeight;
+  layout.files = Math.round(Math.min(Math.max(layout.files, 90), Math.max(90, colH - 140)));
+  layoutEl.style.setProperty("--left-w", `${layout.left}px`);
+  layoutEl.style.setProperty("--right-w", `${layout.right}px`);
+  layoutEl.style.setProperty("--files-h", `${layout.files}px`);
+  $("#files-panel").classList.toggle("collapsed", !!layout.filesCollapsed);
+  if (saveIt) { try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch { /* private mode */ } }
+}
+for (const sp of document.querySelectorAll(".splitter")) {
+  const which = sp.dataset.split;
+  sp.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    sp.setPointerCapture(e.pointerId);
+    sp.classList.add("dragging");
+    document.body.classList.add("resizing");
+    const start = { x: e.clientX, y: e.clientY, ...layout };
+    const move = (ev) => {
+      if (which === "left") layout.left = start.left + (ev.clientX - start.x);
+      else if (which === "right") layout.right = start.right - (ev.clientX - start.x);
+      else layout.files = start.files - (ev.clientY - start.y);
+      applyLayout(false);
+    };
+    const up = () => {
+      sp.releasePointerCapture(e.pointerId);
+      sp.classList.remove("dragging");
+      document.body.classList.remove("resizing");
+      sp.removeEventListener("pointermove", move);
+      sp.removeEventListener("pointerup", up);
+      applyLayout();
+    };
+    sp.addEventListener("pointermove", move);
+    sp.addEventListener("pointerup", up);
+  });
+  sp.addEventListener("dblclick", () => {
+    const key = which === "files" ? "files" : which;
+    layout[key] = LAYOUT_DEFAULT[key];
+    applyLayout();
+  });
+}
+window.addEventListener("resize", () => applyLayout(false));
+applyLayout(false);
+
+// ---------------------------------------------------------------- project explorer
+const filesEl = $("#files");
+const filesState = { expanded: new Set([""]), cache: new Map(), selected: null, query: "", linked: null };
+const IMG_EXT = /\.(png|jpe?g|webp|gif|avif|svg)$/i;
+const AUDIO_EXT = /\.(mp3|ogg|wav|m4a)$/i;
+function fileIcon(name, isDir) {
+  if (isDir) return { cls: "dir", text: "▸" };
+  const ext = (/\.([a-z0-9]+)$/i.exec(name) || [, ""])[1].toLowerCase();
+  if (IMG_EXT.test(name)) return { cls: "img", text: "IMG" };
+  if (AUDIO_EXT.test(name)) return { cls: "audio", text: "♪" };
+  if (["ts", "tsx", "js", "mjs", "jsx", "json", "atlas"].includes(ext)) return { cls: ext, text: ext.toUpperCase().slice(0, 4) };
+  return { cls: "", text: ext ? ext.toUpperCase().slice(0, 4) : "·" };
+}
+async function loadDir(dir) {
+  if (filesState.cache.has(dir)) return filesState.cache.get(dir);
+  const res = await (await fetch(`/__pixi-editor/api/files?dir=${encodeURIComponent(dir)}`)).json();
+  const entries = res.entries || [];
+  filesState.cache.set(dir, entries);
+  return entries;
+}
+function fileRow(e, depth, flat = false) {
+  const row = document.createElement("div");
+  row.className = "file" + (filesState.selected === e.path ? " selected" : "") + (filesState.linked === e.path ? " linked" : "");
+  row.style.paddingLeft = `${6 + depth * 12}px`;
+  row.dataset.path = e.path;
+  const isDir = e.type === "dir";
+  const open = isDir && filesState.expanded.has(e.path);
+  const ico = fileIcon(e.name, isDir);
+  row.innerHTML = `<span class="caret"></span><span class="ico"></span><span class="fname"></span>`;
+  row.querySelector(".caret").textContent = isDir ? (open ? "▾" : "▸") : "";
+  const icoEl = row.querySelector(".ico");
+  icoEl.className = `ico ${ico.cls}`;
+  icoEl.textContent = isDir ? "" : ico.text;
+  row.querySelector(".fname").textContent = e.name;
+  if (flat && e.path.includes("/")) {
+    const d = document.createElement("span");
+    d.className = "fdir";
+    d.textContent = e.path.slice(0, e.path.lastIndexOf("/"));
+    row.appendChild(d);
+  }
+  row.title = isDir ? e.path : `${e.path} — ${formatSize(e.size)} · double-click to open`;
+  row.onclick = () => {
+    if (isDir) {
+      open ? filesState.expanded.delete(e.path) : filesState.expanded.add(e.path);
+      renderFiles();
+      return;
+    }
+    filesState.selected = e.path;
+    for (const r of filesEl.querySelectorAll(".file.selected")) r.classList.remove("selected");
+    row.classList.add("selected");
+    openFileView(e);
+  };
+  if (!isDir) row.ondblclick = () => openInIde(e.path, 1, 1);
+  return row;
+}
+const formatSize = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+let filesToken = 0;
+async function renderFiles() {
+  if (!state.project) { filesEl.innerHTML = `<p class="note">Open a project to see its files.</p>`; return; }
+  const token = ++filesToken;
+  const frag = document.createDocumentFragment();
+  if (filesState.query) {
+    const res = await (await fetch(`/__pixi-editor/api/files?q=${encodeURIComponent(filesState.query)}`)).json();
+    if (token !== filesToken) return;
+    for (const e of res.entries || []) frag.appendChild(fileRow(e, 0, true));
+    if (!(res.entries || []).length) frag.appendChild(Object.assign(document.createElement("p"), { className: "note", textContent: "No file matches." }));
+  } else {
+    const add = async (dir, depth) => {
+      for (const e of await loadDir(dir)) {
+        frag.appendChild(fileRow(e, depth));
+        if (e.type === "dir" && filesState.expanded.has(e.path)) await add(e.path, depth + 1);
+      }
+    };
+    await add("", 0);
+    if (token !== filesToken) return;
+  }
+  const scroll = filesEl.scrollTop;
+  filesEl.replaceChildren(frag);
+  filesEl.scrollTop = scroll;
+}
+/** Reloads the open folders and redraws only if something changed (so clicks aren't lost). */
+let refreshingFiles = false;
+async function refreshFiles() {
+  if (refreshingFiles || filesState.query) return;
+  refreshingFiles = true;
+  try {
+    let changed = false;
+    for (const dir of [...filesState.cache.keys()]) {
+      if (dir && !filesState.expanded.has(dir)) { filesState.cache.delete(dir); continue; }
+      const res = await (await fetch(`/__pixi-editor/api/files?dir=${encodeURIComponent(dir)}`)).json();
+      const entries = res.entries || [];
+      if (JSON.stringify(entries) !== JSON.stringify(filesState.cache.get(dir))) { filesState.cache.set(dir, entries); changed = true; }
+    }
+    if (changed) renderFiles();
+  } catch { /* editor stopped */ } finally { refreshingFiles = false; }
+}
+$("#files-refresh").onclick = () => { filesState.cache.clear(); renderFiles(); };
+$("#files-toggle").onclick = () => { layout.filesCollapsed = !layout.filesCollapsed; applyLayout(); if (!layout.filesCollapsed) renderFiles(); };
+let filesSearchTimer = null;
+$("#files-search").addEventListener("input", (e) => {
+  clearTimeout(filesSearchTimer);
+  filesSearchTimer = setTimeout(() => { filesState.query = e.target.value.trim(); renderFiles(); }, 150);
+});
+$("#files-search").addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Escape") { e.target.value = ""; filesState.query = ""; renderFiles(); }
+  if (e.key === "Enter") { const first = filesEl.querySelector(".file"); if (first) { first.click(); if (!first.querySelector(".caret").textContent) openInIde(first.dataset.path, 1, 1); } }
+});
+// Refresh when the window gets focus again (files may have changed in VS Code) and every few seconds.
+window.addEventListener("focus", () => { if (state.project) refreshFiles(); });
+setInterval(() => { if (state.project && !layout.filesCollapsed && !document.hidden) refreshFiles(); }, 5000);
+
+/** Marks the file that creates the selected object. */
+async function markLinkedFile(o) {
+  const m = o && metaOf(o);
+  let file = null;
+  if (m && m.declId) {
+    await loadInfo([m.declId]);
+    file = state.info.get(m.declId)?.file || null;
+  }
+  if (state.selected !== o) return;
+  filesState.linked = file ? file.split("\\").join("/") : null;
+  for (const r of filesEl.querySelectorAll(".file")) r.classList.toggle("linked", r.dataset.path === filesState.linked);
+}
+
+
+// ---------------------------------------------------------------- mute the game
+const MUTE_KEY = "pixi-editor:muted";
+const muteBtn = $("#btn-mute");
+let gameMuted = false;
+try { gameMuted = localStorage.getItem(MUTE_KEY) === "1"; } catch { /* private mode */ }
+function applyMute() {
+  muteBtn.classList.toggle("muted", gameMuted);
+  muteBtn.title = gameMuted ? "Unmute the game (M)" : "Mute the game (M) — the editor's own previews still play";
+  try { localStorage.setItem(MUTE_KEY, gameMuted ? "1" : "0"); } catch { /* private mode */ }
+  try {
+    const pe = iframe.contentWindow && iframe.contentWindow.__PIXI_EDITOR__;
+    if (pe && pe.setMuted) pe.setMuted(gameMuted);
+  } catch { /* game not loaded */ }
+}
+muteBtn.onclick = () => { gameMuted = !gameMuted; applyMute(); };
+// The runtime starts before the game: tell it as soon as the page exists, and again once connected.
+iframe.addEventListener("load", applyMute);
+applyMute();
+
+
+// ---------------------------------------------------------------- file previews in the inspector
+const TEXT_EXT = /\.(m?[jt]sx?|cjs|json|fnt|md|txt|css|scss|html?|atlas|xml|ya?ml|csv|glsl|frag|vert|wgsl|svg|env|gitignore|prettierrc|eslintrc|editorconfig|log)$/i;
+const fileUrl = (p) => `/__pixi-editor/api/file?path=${encodeURIComponent(p)}`;
+
+/** Shows a project file in the inspector (the scene selection is cleared). */
+function openFileView(e) {
+  state.fileView = e;
+  if (state.selected) { state.selected = null; renderTree(); render(); }
+  renderInspector();
+}
+
+function fileHeader(e, kind) {
+  const head = document.createElement("div");
+  head.className = "obj-head file-head";
+  head.innerHTML = `<div class="obj-row"><div class="file-title"></div><button class="ghost" title="Open in VS Code">Open ↗</button></div><div class="obj-type"></div>`;
+  head.querySelector(".file-title").textContent = e.name;
+  head.querySelector(".obj-type").textContent = `${kind} · ${e.path} · ${formatSize(e.size)}`;
+  head.querySelector("button").onclick = () => openInIde(e.path, 1, 1);
+  return head;
+}
+
+async function renderFileView(e) {
+  inspectorEl.innerHTML = "";
+  const view = document.createElement("div");
+  view.className = "file-view";
+  inspectorEl.appendChild(view);
+  const spine = await spineFilesFor(e);
+  if (state.fileView !== e) return;
+  if (spine) return renderSpineView(view, e, spine);
+  if (IMG_EXT.test(e.name)) return renderImageView(view, e);
+  if (AUDIO_EXT.test(e.name)) return renderAudioView(view, e);
+  if (TEXT_EXT.test(e.name) || !/\.[a-z0-9]+$/i.test(e.name)) return renderCodeView(view, e);
+  view.appendChild(fileHeader(e, "File"));
+  view.appendChild(Object.assign(document.createElement("p"), { className: "note", textContent: "No preview for this kind of file." }));
+}
+
+// ---- images
+function renderImageView(view, e) {
+  view.appendChild(fileHeader(e, "Image"));
+  const bar = document.createElement("div");
+  bar.className = "preview-bar";
+  bar.innerHTML = `<div class="seg"><button data-bg="checker" class="on">Checker</button><button data-bg="dark">Dark</button><button data-bg="light">Light</button></div><button class="ghost" data-zoom>Fit</button>`;
+  const stage = document.createElement("div");
+  stage.className = "image-stage bg-checker fit";
+  const img = document.createElement("img");
+  img.src = fileUrl(e.path);
+  img.onload = () => { info.textContent = `${img.naturalWidth} × ${img.naturalHeight} px`; };
+  img.onerror = () => { info.textContent = "Could not load the image."; };
+  stage.appendChild(img);
+  const info = document.createElement("p");
+  info.className = "note";
+  bar.querySelectorAll("[data-bg]").forEach((b) => {
+    b.onclick = () => {
+      bar.querySelectorAll("[data-bg]").forEach((x) => x.classList.toggle("on", x === b));
+      stage.className = stage.className.replace(/bg-\w+/, `bg-${b.dataset.bg}`);
+    };
+  });
+  const zoomBtn = bar.querySelector("[data-zoom]");
+  zoomBtn.onclick = () => { stage.classList.toggle("fit"); zoomBtn.textContent = stage.classList.contains("fit") ? "Fit" : "100%"; };
+  view.append(bar, stage, info);
+}
+
+// ---- audio
+const fmtTime = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+function renderAudioView(view, e) {
+  view.appendChild(fileHeader(e, "Sound"));
+  const box = document.createElement("div");
+  box.className = "audio-player";
+  box.innerHTML = `
+    <canvas class="wave" height="96"></canvas>
+    <div class="audio-controls">
+      <button class="primary play" title="Play / pause (Space)">▶</button>
+      <span class="time">0:00 / 0:00</span>
+      <label class="loop"><input type="checkbox"> Loop</label>
+      <input class="vol" type="range" min="0" max="1" step="0.01" value="0.8" title="Volume">
+    </div>
+    <p class="note"></p>`;
+  view.appendChild(box);
+  const audio = new Audio(fileUrl(e.path));
+  audio.volume = 0.8;
+  const canvas = box.querySelector("canvas");
+  const playBtn = box.querySelector(".play");
+  const time = box.querySelector(".time");
+  const note = box.querySelector(".note");
+  let peaks = null, raf = 0;
+  const draw = () => {
+    const w = canvas.clientWidth || 260, h = canvas.height;
+    if (canvas.width !== w) canvas.width = w;
+    const c = canvas.getContext("2d");
+    c.clearRect(0, 0, w, h);
+    const p = audio.duration ? audio.currentTime / audio.duration : 0;
+    const accent = getComputedStyle(document.body).getPropertyValue("--accent").trim() || "#ff4f8b";
+    for (let x = 0; x < w; x++) {
+      const v = peaks ? peaks[Math.floor((x / w) * peaks.length)] || 0 : 0.04;
+      const bh = Math.max(1, v * (h - 8));
+      c.fillStyle = x / w <= p ? accent : "#59606d";
+      c.fillRect(x, (h - bh) / 2, 1, bh);
+    }
+    time.textContent = `${fmtTime(audio.currentTime || 0)} / ${fmtTime(audio.duration || 0)}`;
+  };
+  const loop = () => { draw(); if (!audio.paused) raf = requestAnimationFrame(loop); };
+  audio.addEventListener("loadedmetadata", draw);
+  audio.addEventListener("play", () => { playBtn.textContent = "❚❚"; loop(); });
+  audio.addEventListener("pause", () => { playBtn.textContent = "▶"; draw(); });
+  audio.addEventListener("ended", () => { playBtn.textContent = "▶"; draw(); });
+  audio.addEventListener("error", () => { note.textContent = "This browser can't play this file."; });
+  playBtn.onclick = () => (audio.paused ? audio.play() : audio.pause());
+  box.querySelector(".loop input").onchange = (ev) => { audio.loop = ev.target.checked; };
+  box.querySelector(".vol").oninput = (ev) => { audio.volume = Number(ev.target.value); };
+  canvas.onclick = (ev) => {
+    if (!audio.duration) return;
+    const r = canvas.getBoundingClientRect();
+    audio.currentTime = ((ev.clientX - r.left) / r.width) * audio.duration;
+    draw();
+  };
+  const onKeyAudio = (ev) => {
+    if (ev.key !== " " || /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "")) return;
+    ev.preventDefault(); ev.stopPropagation();
+    playBtn.click();
+  };
+  window.addEventListener("keydown", onKeyAudio, true);
+  // Waveform: decode the file once.
+  (async () => {
+    try {
+      const buf = await (await fetch(fileUrl(e.path))).arrayBuffer();
+      const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 2, 44100);
+      const data = await ctx.decodeAudioData(buf);
+      const ch = data.getChannelData(0);
+      const n = 600, step = Math.max(1, Math.floor(ch.length / n));
+      peaks = new Float32Array(n);
+      let max = 0;
+      for (let i = 0; i < n; i++) {
+        let m = 0;
+        for (let j = i * step; j < Math.min(ch.length, (i + 1) * step); j += 4) m = Math.max(m, Math.abs(ch[j]));
+        peaks[i] = m;
+        max = Math.max(max, m);
+      }
+      if (max > 0) for (let i = 0; i < n; i++) peaks[i] /= max;
+      note.textContent = `${data.numberOfChannels === 1 ? "Mono" : "Stereo"} · ${data.duration.toFixed(2)} s`;
+      draw();
+    } catch { /* no waveform */ }
+  })();
+  draw();
+  state.previewCleanup = () => { audio.pause(); audio.src = ""; cancelAnimationFrame(raf); window.removeEventListener("keydown", onKeyAudio, true); };
+}
+
+// ---- code and text
+const JS_KEYWORDS = new Set("abstract as async await break case catch class const continue default delete do else enum export extends false finally for from function get if implements import in instanceof interface let new null of private protected public readonly return set static super switch this throw true try type typeof undefined var void while yield".split(" "));
+/** Tiny highlighter for JS/TS/JSON: returns [{ cls, text }] tokens. */
+function tokenize(code, lang) {
+  const re = lang === "plain" ? /(\n)|([^\n]+)/g
+    : /(\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*(?=\n|$))|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|(\b(?:0x[\da-f]+|\d+\.?\d*(?:e[+-]?\d+)?)\b)|([A-Za-z_$][\w$]*)|(\s+)|([^\sA-Za-z_$\d"'`/#]+|\/)|[\s\S]/gi;
+  const out = [];
+  let m;
+  while ((m = re.exec(code))) {
+    if (lang === "plain") { out.push({ cls: "", text: m[0] }); continue; }
+    if (m[1]) out.push({ cls: lang === "json" || (m[1][0] === "#" && lang !== "atlas" && lang !== "yaml") ? "" : "c", text: m[1] });
+    else if (m[2]) out.push({ cls: lang === "json" && /^\s*:/.test(code.slice(re.lastIndex)) ? "k" : "s", text: m[2] });
+    else if (m[3]) out.push({ cls: "n", text: m[3] });
+    else if (m[4]) out.push({ cls: lang === "json" ? (/^(true|false|null)$/.test(m[4]) ? "kw" : "") : JS_KEYWORDS.has(m[4]) ? "kw" : /^[A-Z]/.test(m[4]) ? "t" : "", text: m[4] });
+    else out.push({ cls: "", text: m[0] });
+  }
+  return out;
+}
+async function renderCodeView(view, e) {
+  view.appendChild(fileHeader(e, "Text"));
+  if (e.size > 2e6) { view.appendChild(Object.assign(document.createElement("p"), { className: "note", textContent: "This file is too big to preview." })); return; }
+  let text = await (await fetch(fileUrl(e.path))).text();
+  if (state.fileView !== e) return;
+  const ext = (/\.([a-z0-9]+)$/i.exec(e.name) || [, ""])[1].toLowerCase();
+  const lang = ext === "json" ? "json" : /^(m?[jt]sx?|cjs)$/.test(ext) ? "js" : ext === "atlas" ? "atlas" : /^(css|scss|glsl|frag|vert|wgsl)$/.test(ext) ? "js" : "plain";
+  const bar = document.createElement("div");
+  bar.className = "preview-bar";
+  const lines0 = text.split("\n");
+  bar.innerHTML = `<span class="note">${lines0.length} lines</span>`;
+  // Minified JSON: offer to format it.
+  if (lang === "json" && lines0.some((l) => l.length > 300)) {
+    const fmtBtn = document.createElement("button");
+    fmtBtn.className = "ghost";
+    fmtBtn.textContent = "Format";
+    fmtBtn.onclick = () => { try { text = JSON.stringify(JSON.parse(text), null, 2); draw(); fmtBtn.remove(); } catch { fmtBtn.textContent = "Invalid JSON"; } };
+    bar.appendChild(fmtBtn);
+  }
+  const pre = document.createElement("div");
+  pre.className = "code-view";
+  view.append(bar, pre);
+  const MAX_LINES = 4000;
+  const draw = () => {
+    const toks = tokenize(text, lang);
+    const lines = [[]];
+    for (const t of toks) {
+      const parts = t.text.split("\n");
+      parts.forEach((p, i) => { if (i) lines.push([]); if (p) lines[lines.length - 1].push({ cls: t.cls, text: p }); });
+    }
+    const frag = document.createDocumentFragment();
+    lines.slice(0, MAX_LINES).forEach((line, i) => {
+      const row = document.createElement("div");
+      row.className = "code-line";
+      const ln = document.createElement("span");
+      ln.className = "ln";
+      ln.textContent = i + 1;
+      const code = document.createElement("span");
+      code.className = "code";
+      for (const t of line) {
+        if (!t.cls) { code.append(t.text); continue; }
+        const sp = document.createElement("span");
+        sp.className = `tk-${t.cls}`;
+        sp.textContent = t.text;
+        code.appendChild(sp);
+      }
+      row.append(ln, code);
+      row.ondblclick = () => openInIde(e.path, i + 1, 1);
+      frag.appendChild(row);
+    });
+    if (lines.length > MAX_LINES) frag.appendChild(Object.assign(document.createElement("p"), { className: "note", textContent: `… ${lines.length - MAX_LINES} more lines (open the file to see them).` }));
+    pre.replaceChildren(frag);
+  };
+  draw();
+}
+
+// ---- spine skeletons (.atlas, or a skeleton .json/.skel next to its .atlas)
+const stripExt = (p) => p.replace(/\.[^./]+$/, "");
+async function dirEntries(dir) {
+  try { return await loadDir(dir); } catch { return []; }
+}
+/** { atlas, skeleton } project paths when `e` is part of a Spine export, else null. */
+async function spineFilesFor(e) {
+  const isAtlas = /\.atlas(\.txt)?$/i.test(e.name);
+  const isSkel = /\.(json|skel)$/i.test(e.name);
+  if (!isAtlas && !isSkel) return null;
+  const dir = e.path.includes("/") ? e.path.slice(0, e.path.lastIndexOf("/")) : "";
+  const files = (await dirEntries(dir)).filter((x) => x.type === "file");
+  const base = stripExt(e.path.replace(/\.txt$/i, ""));
+  if (isAtlas) {
+    const skels = files.filter((x) => /\.(json|skel)$/i.test(x.name));
+    const skel = skels.find((x) => stripExt(x.path) === base) || (skels.length === 1 ? skels[0] : null);
+    return skel ? { atlas: e.path, skeleton: skel.path } : { atlas: e.path, skeleton: null };
+  }
+  const atlases = files.filter((x) => /\.atlas(\.txt)?$/i.test(x.name));
+  const atlas = atlases.find((x) => stripExt(x.path.replace(/\.txt$/i, "")) === base);
+  if (!atlas) return null;
+  if (/\.json$/i.test(e.name)) {
+    // Only Spine exports: { "skeleton": {…}, "bones": […] }
+    try { const head = (await (await fetch(fileUrl(e.path))).text()).slice(0, 4000); if (!/"skeleton"\s*:/.test(head) || !/"bones"\s*:/.test(head)) return null; } catch { return null; }
+  }
+  return { atlas: atlas.path, skeleton: e.path };
+}
+/** URL the game serves a project file at (Vite serves public/ at the root). */
+const servedUrl = (p) => "/" + p.replace(/^public\//, "");
+
+async function spineRuntime() {
+  if (state.spineMod !== undefined && state.spineModWin === state.win) return state.spineMod;
+  state.spineModWin = state.win;
+  try { const mod = await state.win.eval(`import("/@pixi-editor/spine.ts")`); state.spineMod = mod.available ? mod : null; }
+  catch { state.spineMod = null; }
+  return state.spineMod;
+}
+
+/** Back to the setup pose (Spine 4.2: setToSetupPose / 4.3: setupPose). */
+function setupPose(sk, slotsOnly = false) {
+  const fn = slotsOnly ? sk.setupPoseSlots || sk.setSlotsToSetupPose : sk.setupPose || sk.setToSetupPose;
+  if (fn) fn.call(sk);
+}
+
+async function renderSpineView(view, e, files) {
+  view.appendChild(fileHeader(e, "Spine"));
+  const msg = (text) => { const p = document.createElement("p"); p.className = "note"; p.style.padding = "8px 12px"; p.textContent = text; view.appendChild(p); return p; };
+  if (!files.skeleton) { msg("No skeleton (.json or .skel) with the same name was found next to this atlas."); return; }
+  if (!state.app || !state.PIXI) { msg("Waiting for the game to load — the preview uses the game's own Pixi and Spine."); return; }
+  const Spine = (await spineRuntime())?.Spine;
+  if (!Spine) { msg("This project doesn't use the Spine runtime for Pixi (@esotericsoftware/spine-pixi-v8)."); return; }
+  if (state.fileView !== e) return;
+  const P = state.PIXI;
+  const loading = msg("Loading skeleton…");
+
+  // Reuse what the game already loaded; otherwise load it (same URLs the game would use).
+  let keys = loadedSpines().find((sp) => sp.skeleton.some((k) => baseName(k) === baseName(files.skeleton)) && sp.atlas.some((k) => baseName(k) === baseName(files.atlas)));
+  let skelKey, atlasKey;
+  if (keys) { skelKey = keys.skeleton[0]; atlasKey = keys.atlas[0]; }
+  else {
+    skelKey = `pixi-editor:${files.skeleton}`;
+    atlasKey = `pixi-editor:${files.atlas}`;
+    try {
+      if (!P.Cache.has(atlasKey)) await P.Assets.load({ alias: atlasKey, src: servedUrl(files.atlas) });
+      if (!P.Cache.has(skelKey)) await P.Assets.load({ alias: skelKey, src: servedUrl(files.skeleton) });
+    } catch (err) {
+      loading.textContent = `Could not load the skeleton: ${err.message || err}`;
+      return;
+    }
+  }
+  if (state.fileView !== e) return;
+  let sp;
+  try { sp = Spine.from({ skeleton: skelKey, atlas: atlasKey }); } catch (err) { loading.textContent = `Could not create the spine: ${err.message || err}`; return; }
+  sp.autoUpdate = false;
+  loading.remove();
+
+  const data = sp.skeleton.data;
+  const anims = data.animations;
+  const skins = data.skins.map((s) => s.name);
+  const box = document.createElement("div");
+  box.className = "spine-preview";
+  box.innerHTML = `
+    <div class="preview-bar"><div class="seg"><button data-bg="checker" class="on">Checker</button><button data-bg="dark">Dark</button><button data-bg="light">Light</button></div></div>
+    <div class="spine-stage bg-checker"><canvas></canvas></div>
+    <div class="audio-controls spine-controls">
+      <button class="primary play" title="Play / pause (Space)">❚❚</button>
+      <span class="time">0.00 s</span>
+      <label class="loop"><input type="checkbox" checked> Loop</label>
+      <select class="speed" title="Speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
+    </div>
+    <div class="row single skin-row"><label>Skin</label><div class="field"><select class="skin"></select></div></div>
+    <div class="anim-list"></div>
+    <p class="note spine-info"></p>`;
+  view.appendChild(box);
+  const canvas = box.querySelector("canvas");
+  const stage = box.querySelector(".spine-stage");
+  const playBtn = box.querySelector(".play");
+  const timeEl = box.querySelector(".time");
+  const loopBox = box.querySelector(".loop input");
+  const speedSel = box.querySelector(".speed");
+  const list = box.querySelector(".anim-list");
+  box.querySelector(".spine-info").textContent = `${anims.length} animations · ${data.bones.length} bones · ${data.slots.length} slots · ${files.skeleton} + ${files.atlas}`;
+  box.querySelectorAll("[data-bg]").forEach((b) => {
+    b.onclick = () => {
+      box.querySelectorAll("[data-bg]").forEach((x) => x.classList.toggle("on", x === b));
+      stage.className = stage.className.replace(/bg-\w+/, `bg-${b.dataset.bg}`);
+    };
+  });
+  const skinSel = box.querySelector(".skin");
+  if (skins.length > 1) {
+    for (const s of skins) skinSel.appendChild(Object.assign(document.createElement("option"), { value: s, textContent: s }));
+    skinSel.onchange = () => { sp.skeleton.setSkinByName(skinSel.value); setupPose(sp.skeleton, true); fit(); };
+  } else box.querySelector(".skin-row").remove();
+
+  const container = new P.Container();
+  container.addChild(sp);
+  const W = 480, H = 360; // render size (scaled by CSS)
+  canvas.width = W;
+  canvas.height = H;
+  const rt = P.RenderTexture.create({ width: W, height: H, resolution: 1 });
+  let current = null, playing = true, raf = 0, last = performance.now(), elapsed = 0;
+
+  /** Scales and centers the skeleton to show the whole animation. */
+  function fit() {
+    const b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    const add = () => { const r = sp.getLocalBounds(); if (r.width > 0 && r.height > 0) { b.minX = Math.min(b.minX, r.minX ?? r.x); b.minY = Math.min(b.minY, r.minY ?? r.y); b.maxX = Math.max(b.maxX, r.maxX ?? r.x + r.width); b.maxY = Math.max(b.maxY, r.maxY ?? r.y + r.height); } };
+    const dur = current ? current.duration : 0;
+    if (current && dur > 0) {
+      sp.state.setAnimation(0, current.name, false);
+      for (let i = 0; i <= 8; i++) { sp.update(i ? dur / 8 : 0); add(); }
+      sp.state.setAnimation(0, current.name, loopBox.checked);
+      sp.update(0);
+    } else { sp.update(0); add(); }
+    if (!isFinite(b.minX)) { b.minX = -100; b.minY = -100; b.maxX = 100; b.maxY = 100; }
+    const k = Math.min((W * 0.88) / (b.maxX - b.minX), (H * 0.88) / (b.maxY - b.minY), 4);
+    sp.scale.set(k);
+    sp.position.set(W / 2 - ((b.minX + b.maxX) / 2) * k, H / 2 - ((b.minY + b.maxY) / 2) * k);
+    elapsed = 0;
+  }
+  function play(anim) {
+    current = anim;
+    list.querySelectorAll(".anim").forEach((x) => x.classList.toggle("on", x.dataset.name === anim.name));
+    sp.state.clearTracks();
+    setupPose(sp.skeleton);
+    fit();
+    playing = true;
+    playBtn.textContent = "❚❚";
+  }
+  for (const a of anims) {
+    const row = document.createElement("button");
+    row.className = "anim";
+    row.dataset.name = a.name;
+    row.innerHTML = `<span></span><small></small>`;
+    row.querySelector("span").textContent = a.name;
+    row.querySelector("small").textContent = `${a.duration.toFixed(2)} s`;
+    row.onclick = () => play(a);
+    list.appendChild(row);
+  }
+  if (!anims.length) list.innerHTML = `<p class="note">This skeleton has no animations (setup pose shown).</p>`;
+
+  const draw = () => {
+    try {
+      state.app.renderer.render({ container, target: rt, clear: true, clearColor: [0, 0, 0, 0] });
+      const src = state.app.renderer.extract.canvas(rt);
+      const c = canvas.getContext("2d");
+      c.clearRect(0, 0, W, H);
+      c.drawImage(src, 0, 0, W, H);
+    } catch { /* renderer busy or lost */ }
+  };
+  const tick = (now) => {
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    if (playing) {
+      const speed = Number(speedSel.value);
+      sp.update(dt * speed);
+      elapsed += dt * speed;
+      const entry = sp.state.tracks[0];
+      if (entry && current) {
+        const t = loopBox.checked && current.duration > 0 ? elapsed % current.duration : Math.min(elapsed, current.duration);
+        timeEl.textContent = `${t.toFixed(2)} / ${current.duration.toFixed(2)} s`;
+        if (!loopBox.checked && elapsed >= current.duration) { playing = false; playBtn.textContent = "▶"; }
+      }
+    }
+    // ~30 fps is plenty for a preview (each frame is read back from the GPU).
+    if (now - lastDraw > 30) { lastDraw = now; draw(); }
+    raf = requestAnimationFrame(tick);
+  };
+  let lastDraw = 0;
+  playBtn.onclick = () => {
+    if (!playing && current && !loopBox.checked && elapsed >= current.duration) play(current);
+    else { playing = !playing; playBtn.textContent = playing ? "❚❚" : "▶"; }
+  };
+  loopBox.onchange = () => { if (current) { const t = sp.state.tracks[0]; if (t) t.loop = loopBox.checked; } };
+  const onKeySpine = (ev) => {
+    if (ev.key !== " " || /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "")) return;
+    ev.preventDefault(); ev.stopPropagation();
+    playBtn.click();
+  };
+  window.addEventListener("keydown", onKeySpine, true);
+  if (anims.length) play(anims.find((a) => /idle|loop/i.test(a.name)) || anims[0]); else fit();
+  raf = requestAnimationFrame(tick);
+  state.previewCleanup = () => {
+    cancelAnimationFrame(raf);
+    window.removeEventListener("keydown", onKeySpine, true);
+    try { container.destroy({ children: true }); rt.destroy(true); } catch { /* already gone */ }
+  };
+}

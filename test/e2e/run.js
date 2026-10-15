@@ -273,6 +273,93 @@ const scenarios = [
       check(await prettier.check(after, { ...cfg, filepath: file }), "file is still Prettier-clean");
     },
   },
+  {
+    name: "basic: project explorer and resizable panels",
+    fixture: "basic",
+    async run(ed) {
+      const page = ed.page;
+      const names = () => page.$$eval("#files .file .fname", (r) => r.map((x) => x.textContent));
+      await page.waitForFunction(() => document.querySelectorAll("#files .file").length > 0, null, { timeout: 10000 });
+      const root = await names();
+      check(["src", "index.html", "package.json"].every((n) => root.includes(n)), "explorer lists the project root", root.join(", "));
+      await page.click('#files .file[data-path="src"]');
+      await page.waitForSelector('#files .file[data-path="src/hud.ts"]');
+      check(true, "opening src shows its files");
+      await ed.select("title");
+      await page.waitForSelector('#files .file.linked[data-path="src/hud.ts"]', { timeout: 5000 }).catch(() => {});
+      check(await page.$('#files .file.linked[data-path="src/hud.ts"]'), "the selected object's file is marked");
+      await page.click('#files .file[data-path="src/hud.ts"]');
+      await page.waitForSelector(".file-view .code-line", { timeout: 5000 }).catch(() => {});
+      check(await page.$(".file-view .code-line"), "clicking a file shows it in the inspector");
+      await page.fill("#files-search", "main");
+      await page.waitForTimeout(500);
+      check((await names()).join() === "main.ts", "file search", (await names()).join());
+      await page.fill("#files-search", "");
+      await page.dispatchEvent("#files-search", "input");
+
+      // Resize the left column and the files panel, then reload: sizes are kept.
+      const width = () => page.$eval("#left-side", (e) => Math.round(e.getBoundingClientRect().width));
+      const w0 = await width();
+      const sp = await page.$eval('.splitter[data-split="left"]', (e) => { const r = e.getBoundingClientRect(); return { x: r.left + 2, y: r.top + 200 }; });
+      await page.mouse.move(sp.x, sp.y);
+      await page.mouse.down();
+      await page.mouse.move(sp.x + 80, sp.y, { steps: 5 });
+      await page.mouse.up();
+      check((await width()) === w0 + 80, "dragging the splitter widens the left column", `${w0} -> ${await width()}`);
+      const ip = await page.$eval('.splitter[data-split="right"]', (e) => { const r = e.getBoundingClientRect(); return { x: r.left + 2, y: r.top + 200 }; });
+      const iw = () => page.$eval("#inspector-panel", (e) => Math.round(e.getBoundingClientRect().width));
+      const i0 = await iw();
+      await page.mouse.move(ip.x, ip.y);
+      await page.mouse.down();
+      await page.mouse.move(ip.x - 60, ip.y, { steps: 5 });
+      await page.mouse.up();
+      check((await iw()) === i0 + 60, "dragging the other splitter widens the inspector", `${i0} -> ${await iw()}`);
+      await page.click("#files-toggle");
+      check(await page.$eval("#files-panel", (e) => e.classList.contains("collapsed")), "the files panel collapses");
+      await page.reload();
+      await page.waitForFunction(() => /^Connected to/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      check((await width()) === w0 + 80 && (await iw()) === i0 + 60, "sizes are kept after reloading");
+      check(await page.$eval("#files-panel", (e) => e.classList.contains("collapsed")), "collapsed state is kept");
+      await page.click("#files-toggle");
+    },
+  },
+  {
+    name: "factory: file previews and mute",
+    fixture: "factory",
+    async run(ed) {
+      const page = ed.page;
+      const open = async (p) => {
+        await page.evaluate(async (p) => {
+          const dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+          const list = (await (await fetch(`/__pixi-editor/api/files?dir=${encodeURIComponent(dir)}`)).json()).entries;
+          const e = list.find((x) => x.path === p);
+          window.pixiEditor.openFile(p, e ? e.size : 0);
+        }, p);
+        await page.waitForTimeout(800);
+      };
+      await open("src/main.ts");
+      check((await page.$$eval(".code-line", (l) => l.length)) >= 15, "code preview shows the lines");
+      check((await page.$$eval(".tk-kw", (l) => l.map((x) => x.textContent))).includes("const"), "code preview highlights keywords");
+      await open("public/coin.png");
+      await page.waitForFunction(() => /×/.test(document.querySelector(".file-view").textContent), null, { timeout: 5000 }).catch(() => {});
+      check(/48 × 48 px/.test(await page.textContent(".file-view")), "image preview shows the size");
+      await open("public/coin.wav");
+      await page.waitForFunction(() => / s$/.test(document.querySelector(".audio-player .note")?.textContent || ""), null, { timeout: 8000 }).catch(() => {});
+      check(/Mono · 0.40 s/.test(await page.textContent(".audio-player .note")), "audio preview decodes the sound", await page.textContent(".audio-player .note"));
+      await ed.select("gem");
+      check(await page.$("input.obj-name"), "selecting an object brings the inspector back");
+
+      const muted = () => page.evaluate(() => document.querySelector("#game").contentWindow.__PIXI_EDITOR__.isMuted());
+      check(!(await muted()), "game starts with sound");
+      await page.click("#btn-mute");
+      check(await muted(), "mute button mutes the game");
+      await page.reload();
+      await page.waitForFunction(() => /^Connected to/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      check(await muted(), "the game stays muted after reloading");
+      await page.click("#btn-mute");
+      check(!(await muted()), "and can be unmuted");
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- main
