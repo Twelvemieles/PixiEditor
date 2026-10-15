@@ -1,0 +1,25 @@
+{
+  "name": "pixi-editor",
+  "version": "0.1.0",
+  "description": "Visual editor for existing PixiJS projects",
+  "scripts": {
+    "start": "node bin/pixi-editor.js",
+    "test": "node test/run.js"
+  },
+  "keywords": [
+    "pixi",
+    "pixijs",
+    "editor",
+    "vite"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@babel/parser": "^7.29.9",
+    "magic-string": "^1.4.3"
+  },
+  "type": "module",
+  "bin": {
+    "pixi-editor": "bin/pixi-editor.js"
+  }
+}
