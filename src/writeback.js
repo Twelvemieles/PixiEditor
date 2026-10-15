@@ -52,9 +52,10 @@ const DECIMALS = {
   position: 2, x: 2, y: 2, pivot: 2, "pivot.x": 2, "pivot.y": 2,
   scale: 3, "scale.x": 3, "scale.y": 3, anchor: 3, "anchor.x": 3, "anchor.y": 3,
   rotation: 4, angle: 2, alpha: 3,
+  "style.fontSize": 1, "style.letterSpacing": 1, "style.lineHeight": 1,
 };
 const VEC_KINDS = new Set(["position", "scale", "pivot", "anchor", "skew"]);
-const STRING_KINDS = new Set(["text", "label"]);
+const STRING_KINDS = new Set(["text", "label", "animation", "style.fontFamily", "style.fontWeight", "style.fontStyle", "style.align"]);
 const COLOR_KINDS = new Set(["tint", "style.fill"]);
 // Values that need the whole project to be written (asset constants, variables in scope).
 const RESOLVED_TYPES = new Set(["texture", "spine", "parent"]);

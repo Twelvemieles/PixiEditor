@@ -57,6 +57,15 @@ const PROPS = {
   parent: { get: (o) => o.parent, set: (o, v) => { if (v && o.parent !== v) v.addChild(o); } },
   // Spine skeleton: "" = as created by the code, otherwise JSON { skeleton: keys[], atlas: keys[] }.
   spine: { get: (o) => o.__peSpine || "", set: (o, v) => setSpine(o, v) },
+  // Spine animation on track 0.
+  animation: {
+    get: (o) => (o.state && o.state.tracks && o.state.tracks[0] && o.state.tracks[0].animation ? o.state.tracks[0].animation.name : ""),
+    set: (o, v) => { if (v && o.state) { o.state.setAnimation(0, v, true); if (typeof o.update === "function") o.update(0); } },
+  },
+  ...Object.fromEntries(["fontFamily", "fontSize", "fontWeight", "fontStyle", "align", "letterSpacing", "lineHeight"].map((k) => [k, {
+    get: (o) => { const v = o.style ? o.style[k] : undefined; return Array.isArray(v) ? v.join(", ") : v ?? (/Size|Spacing|Height/.test(k) ? 0 : ""); },
+    set: (o, v) => { if (o.style) o.style[k] = v; },
+  }])),
   // Index among its siblings (draw order).
   order: { get: (o) => (o.parent ? o.parent.getChildIndex(o) : 0), set: (o, v) => { if (o.parent) o.parent.setChildIndex(o, Math.max(0, Math.min(v, o.parent.children.length - 1))); } },
 };
@@ -82,7 +91,8 @@ function propDef(p) {
   };
 }
 // Value properties are saved by replacing a literal, not by adjusting a number.
-const VALUE_TYPE = { text: "string", label: "string", tint: "color", textFill: "color", texture: "texture", parent: "parent", spine: "spine", order: "order" };
+const VALUE_TYPE = { text: "string", label: "string", tint: "color", textFill: "color", texture: "texture", parent: "parent", spine: "spine", order: "order",
+  animation: "string", fontFamily: "string", fontWeight: "string", fontStyle: "string", align: "string" };
 const valueTypeOf = (p) => VALUE_TYPE[p] || (p.startsWith("gfill:") ? "color" : null);
 const sameValue = (a, b) => (typeof a === "number" && typeof b === "number" ? Math.abs(a - b) < 1e-9 : a === b);
 
@@ -118,13 +128,20 @@ const CANDIDATES = {
   texture: [["texture"]],
   parent: [["parent"]],
   spine: [["spine"]],
+  animation: [["animation"]],
+  fontFamily: [["style.fontFamily"]], fontSize: [["style.fontSize"]], fontWeight: [["style.fontWeight"]],
+  fontStyle: [["style.fontStyle"]], align: [["style.align"]], letterSpacing: [["style.letterSpacing"]], lineHeight: [["style.lineHeight"]],
 };
 const ASSET_PROPS = new Set(["texture", "parent", "spine"]);
+// Shown only for some kinds of objects (spines, texts): not listed as "missing" for the others.
+const OPTIONAL_PROPS = new Set(["animation", "fontFamily", "fontSize", "fontWeight", "fontStyle", "align", "letterSpacing", "lineHeight"]);
 const candidatesOf = (p) => CANDIDATES[p] || (p.startsWith("gfill:") ? [[p]] : []);
 const INSERT_GROUP = {
   x: "position", y: "position", scaleX: "scale", scaleY: "scale", rotation: "rotation", alpha: "alpha",
   pivotX: "pivot", pivotY: "pivot", anchorX: "anchor", anchorY: "anchor",
   text: "text", label: "label", tint: "tint", textFill: "style.fill",
+  fontFamily: "style.fontFamily", fontSize: "style.fontSize", fontWeight: "style.fontWeight", fontStyle: "style.fontStyle",
+  align: "style.align", letterSpacing: "style.letterSpacing", lineHeight: "style.lineHeight",
 };
 
 // ---------------------------------------------------------------- components
@@ -269,6 +286,7 @@ iframe.addEventListener("load", () => {
       c.className = "connecting hidden";
       win.addEventListener("keydown", onKey, true);
       setMode(state.mode);
+      if (iframe.classList.contains("sized")) setTimeout(zoomFit, 300); // a screen size preset: show all of it
       if (state.afterReload) { setStatus(state.afterReload, "ok"); state.afterReload = null; }
       else setStatus(`Connected to ${state.project ? state.project.name : "the game"} — the game is running. Press Edit (Ctrl/Cmd+E) to select objects.`);
       loadComponents();
@@ -360,8 +378,9 @@ function zoomBy(factor) {
 }
 function zoomReset() { state.view = { z: 1, x: 0, y: 0 }; applyView(); }
 function zoomFit() {
-  if (!state.app) return zoomReset();
-  const r = canvasRect();
+  if (!state.app && !iframe.classList.contains("sized")) return zoomReset();
+  // With a screen size preset, show the whole "screen"; otherwise the game's canvas.
+  const r = iframe.classList.contains("sized") ? { left: 0, top: 0, width: iframe.offsetWidth, height: iframe.offsetHeight } : canvasRect();
   const W = overlay.clientWidth, H = overlay.clientHeight;
   const z = Math.min(8, Math.max(0.1, Math.min((W * 0.94) / r.width, (H * 0.94) / r.height)));
   state.view = { z, x: W / 2 - (r.left + r.width / 2) * z, y: H / 2 - (r.top + r.height / 2) * z };
@@ -818,6 +837,8 @@ const PROP_LABEL = {
   x: "x", y: "y", scaleX: "scale x", scaleY: "scale y", rotation: "rotation", alpha: "alpha",
   pivotX: "pivot x", pivotY: "pivot y", anchorX: "anchor x", anchorY: "anchor y", text: "text", label: "name",
   tint: "tint", textFill: "text color", texture: "texture", parent: "parent", spine: "spine", order: "draw order",
+  animation: "animation", fontFamily: "font", fontSize: "font size", fontWeight: "weight", fontStyle: "style", align: "align",
+  letterSpacing: "letter spacing", lineHeight: "line height",
 };
 function showValue(prop, v) {
   if (prop === "rotation") return `${fmtNum((v * 180) / Math.PI, 1)}°`;
@@ -1713,10 +1734,11 @@ function renderAppearance(o) {
   sec.innerHTML = `<h4>Appearance</h4>`;
   const m = metaOf(o);
   if (isSprite(o)) sec.appendChild(textureRow(o));
-  if (isSpine(o)) sec.appendChild(spineRow(o));
+  if (isSpine(o)) { sec.appendChild(spineRow(o)); sec.appendChild(animationRow(o)); }
   if (typeof o.tint === "number") sec.appendChild(colorRow(o, "tint", "Tint"));
   if ("text" in o && (typeof o.text === "string" || typeof o.text === "number")) sec.appendChild(textRow(o));
   if (o.style && colorToNumber(o.style.fill) != null) sec.appendChild(colorRow(o, "textFill", "Text color"));
+  if (isTextLike(o)) for (const row of textStyleRows(o)) sec.appendChild(row);
   const fills = fillInstructions(o);
   if (m) {
     Object.keys(m.sites).filter((k) => k.startsWith("gfill:")).sort().forEach((k) => {
@@ -1846,7 +1868,7 @@ function renderInspector() {
         }
       }
       if (!m.declId || !state.info.get(m.declId)?.canInsert) {
-        const missing = Object.keys(CANDIDATES).filter((p) => !ASSET_PROPS.has(p) && !bestSite(m, p));
+        const missing = Object.keys(CANDIDATES).filter((p) => !ASSET_PROPS.has(p) && !OPTIONAL_PROPS.has(p) && !bestSite(m, p));
         if (missing.length && !m.declId) {
           const n = document.createElement("p");
           n.className = "note";
@@ -2890,3 +2912,103 @@ async function duplicateSelected() {
   render();
   setStatus(`Duplicated ${nameOf(o)}${res.name !== nameOf(o) ? ` as ${res.name}` : ""} — ${res.file}:${res.line}. It's in the same place: drag it away.`, "ok");
 }
+
+
+// ---------------------------------------------------------------- spine animation and text style rows
+/** A dropdown that changes one property (saved like the others). */
+function selectRow(o, prop, labelText, options) {
+  const row = document.createElement("div");
+  row.className = "row single";
+  row.innerHTML = `<label></label><div class="field"><select></select></div>`;
+  row.querySelector("label").textContent = labelText;
+  const sel = row.querySelector("select");
+  const cur = String(propDef(prop).get(o));
+  const list = options.includes(cur) || !cur ? options : [cur, ...options];
+  for (const v of list) { const op = document.createElement("option"); op.value = v; op.textContent = v || "—"; sel.appendChild(op); }
+  sel.value = cur;
+  sel.dataset.vprop = prop;
+  sel.onchange = () => {
+    const before = { [prop]: propDef(prop).get(o) };
+    const after = { [prop]: sel.value };
+    setLive(o, after);
+    commit(o, before, after);
+  };
+  return row;
+}
+
+function animationRow(o) {
+  const names = ((o.skeleton && o.skeleton.data && o.skeleton.data.animations) || []).map((a) => a.name);
+  const row = selectRow(o, "animation", "Animation", names);
+  row.title = "Plays in a loop while you edit. Saved where the code chooses the animation (setAnimation / animationName).";
+  return row;
+}
+
+const isTextLike = (o) => !!(o && o.style && "fontSize" in o.style && (typeof o.text === "string" || typeof o.text === "number"));
+
+function textStyleRows(o) {
+  const rows = [];
+  // Font: free text, with the fonts the game's page has loaded as suggestions.
+  const fontRow = document.createElement("div");
+  fontRow.className = "row single";
+  fontRow.innerHTML = `<label>Font</label><div class="field"><input type="text" spellcheck="false" list="font-list"><datalist id="font-list"></datalist></div>`;
+  const input = fontRow.querySelector("input");
+  input.dataset.vprop = "fontFamily";
+  const families = new Set(["Arial", "Helvetica", "Verdana", "Georgia", "Times New Roman", "Courier New", "monospace", "sans-serif", "serif"]);
+  try { for (const f of state.win.document.fonts) families.add(f.family.replace(/^["']|["']$/g, "")); } catch { /* no font list */ }
+  const dl = fontRow.querySelector("datalist");
+  for (const f of families) { const op = document.createElement("option"); op.value = f; dl.appendChild(op); }
+  let before = null;
+  input.addEventListener("focus", () => { before = readVals(o, ["fontFamily"]); });
+  input.addEventListener("change", () => {
+    const after = { fontFamily: input.value.trim() };
+    if (!after.fontFamily) { refreshInspectorValues(true); return; }
+    setLive(o, after);
+    commit(o, before || readVals(o, ["fontFamily"]), after);
+    before = readVals(o, ["fontFamily"]);
+  });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  rows.push(fontRow);
+  rows.push(numberRow(o, { label: "Size", props: [["fontSize", "", 0.5, null, [1, 1000]]] }));
+  rows.push(selectRow(o, "fontWeight", "Weight", ["normal", "bold", "100", "200", "300", "400", "500", "600", "700", "800", "900"]));
+  rows.push(selectRow(o, "fontStyle", "Style", ["normal", "italic", "oblique"]));
+  rows.push(selectRow(o, "align", "Align", ["left", "center", "right", "justify"]));
+  rows.push(numberRow(o, { label: "Spacing", props: [["letterSpacing", "", 0.1]] }));
+  return rows;
+}
+
+
+// ---------------------------------------------------------------- screen size presets
+const SCREEN_KEY = "pixi-editor:screen";
+const screenSelect = $("#screen-size");
+/** Gives the game iframe a fixed size (the game sees a window of that size), or the whole viewport. */
+function applyScreen(value, fit = true) {
+  const m = /^(\d+)x(\d+)$/.exec(value || "");
+  if (m) {
+    iframe.style.width = `${m[1]}px`;
+    iframe.style.height = `${m[2]}px`;
+  } else {
+    iframe.style.width = iframe.style.height = "";
+  }
+  iframe.classList.toggle("sized", !!m);
+  $("#viewport").classList.toggle("sized", !!m);
+  try { localStorage.setItem(SCREEN_KEY, m ? value : ""); } catch { /* private mode */ }
+  if (m && ![...screenSelect.options].some((o) => o.value === value)) {
+    const op = document.createElement("option");
+    op.value = value;
+    op.textContent = `Custom · ${m[1]}×${m[2]}`;
+    screenSelect.insertBefore(op, screenSelect.lastElementChild);
+  }
+  screenSelect.value = m ? value : "";
+  // Let the game handle its resize, then show all of it.
+  if (fit) setTimeout(() => { render(); m ? zoomFit() : zoomReset(); }, 250);
+}
+screenSelect.onchange = () => {
+  let v = screenSelect.value;
+  if (v === "custom") {
+    const answer = window.prompt("Screen size (width × height in pixels):", "1280x720");
+    const m = /(\d+)\s*[x×*, ]\s*(\d+)/.exec(answer || "");
+    v = m ? `${m[1]}x${m[2]}` : (iframe.classList.contains("sized") ? `${parseInt(iframe.style.width)}x${parseInt(iframe.style.height)}` : "");
+  }
+  applyScreen(v);
+};
+try { const saved = localStorage.getItem(SCREEN_KEY); if (saved) applyScreen(saved, false); } catch { /* private mode */ }

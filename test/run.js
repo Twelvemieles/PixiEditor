@@ -181,4 +181,24 @@ export function f(hud: Container) {
   assert.match(apply(code, el.edits), /children: \[coin, label\]/);
 }
 
+// --- spine animation and text style sites
+{
+  let k = 0;
+  const src = `const t = new Text({ text: "a", style: { fontSize: 24, fontWeight: "700", fill: 0xffffff } });
+t.style.align = "center";
+const s = createSpineAnimation({ skeletonKey: SPINES.A.SKEL, atlasKey: SPINES.A.ATLAS, animationName: "idle" });
+s.state.setAnimation(0, "win", true);
+const b = createText({ text: "x", fontSize: 22 });
+`;
+  const out = instrument(src, "/s.ts", (p) => p + ++k);
+  const kinds = out.sites.map((x) => `${x.kind}=${x.args.map((a) => a.text).join("|")}`);
+  for (const want of ["style.fontSize=24", 'style.fontWeight="700"', 'style.align="center"', 'animation="idle"', 'animation="win"', "style.fontSize=22"]) {
+    assert.ok(kinds.includes(want), `${want} in ${kinds.join(", ")}`);
+  }
+  assert.match(out.code, /__pixiEditor\$\.s\(s, "animation", "s\d+"\)\.state\.setAnimation\(0, "win", true\)/);
+  const fs = out.sites.find((x) => x.kind === "style.fontSize" && x.args[0].text === "24");
+  const { edits } = planEdits(src, [{ site: fs, deltas: [4] }], []);
+  assert.equal(edits[0].text, "28");
+}
+
 console.log("OK — all tests pass");

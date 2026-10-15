@@ -208,6 +208,14 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .zoom button + button { border-left: 1px solid var(--line); }
 .zoom button:hover { color: var(--text); background: var(--panel-2); }
 #zoom-level { min-width: 52px; }
+#screen-size {
+  background: transparent; border: 0; border-right: 1px solid var(--line); color: var(--dim);
+  font: 12px var(--mono); padding: 0 6px; max-width: 170px; cursor: pointer;
+}
+#screen-size:hover { color: var(--text); background: var(--panel-2); }
+#screen-size option { background: var(--panel); color: var(--text); }
+.viewport.sized { background: repeating-linear-gradient(45deg, #15171c 0 10px, #181b21 10px 20px); }
+#game.sized { right: auto; bottom: auto; box-shadow: 0 0 0 1px var(--line), 0 10px 40px rgba(0,0,0,.5); }
 
 /* --- Components --- */
 .comp { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 8px 8px 2px; margin-bottom: 8px; }

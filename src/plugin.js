@@ -606,7 +606,7 @@ export default function pixiEditor() {
    */
   function placeWithoutStatement(decl, e) {
     const key = e.kind;
-    if (key === "style.fill") return { error: `"${decl.name}" has no variable, so its text color can only be saved where the style is defined.` };
+    if (key.startsWith("style.")) return { error: `"${decl.name}" has no variable, so its text style can only be saved where the style is defined.` };
     const code = fs.readFileSync(decl.file, "utf8");
     const literal = findLiteral(code, decl);
     if (!literal) return { error: `Could not find where "${decl.name}" is created.` };

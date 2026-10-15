@@ -18,6 +18,9 @@ const VEC = new Set(["position", "scale", "anchor", "pivot", "skew"]);
 // Scalar properties set via assignment.
 const SCALAR = new Set(["x", "y", "rotation", "angle", "alpha", "text", "label", "tint", "texture"]);
 
+// Text style properties the editor can change.
+export const STYLE_KEYS = ["fontFamily", "fontSize", "fontWeight", "fontStyle", "align", "letterSpacing", "lineHeight"];
+
 const SKIP_KEYS = new Set(["loc", "start", "end", "extra", "leadingComments", "trailingComments", "innerComments", "range"]);
 
 function walk(node, parents, visit) {
@@ -216,6 +219,7 @@ export function instrument(code, file, nextId) {
     } else if (isNew && isTextClass && a0 && (a0.type === "StringLiteral" || a0.type === "TemplateLiteral")) {
       add("text", a0); // new Text("Hello", style)
       add("style.fill", objProp(a1, "fill")?.value);
+      for (const key of STYLE_KEYS) add(`style.${key}`, objProp(a1, key)?.value);
     } else if (isNew && /Sprite$/.test(calleeName(root) || "") && a0) {
       add("texture", a0); // new Sprite(texture)
     }
@@ -269,6 +273,8 @@ export function instrument(code, file, nextId) {
     const skel = objProp(lit, "skeleton") || objProp(lit, "skeletonKey");
     const atlas = objProp(lit, "atlas") || objProp(lit, "atlasKey");
     if (skel && atlas) add("spine", [skel.value, atlas.value]);
+    // createSpineAnimation({ animationName: "idle" }) / { animation: "idle" } next to a skeleton
+    add("animation", (objProp(lit, "animationName") || (skel ? objProp(lit, "animation") : null))?.value);
     if (spineOnly) return opts;
     for (const key of ["position", "scale", "anchor", "pivot", "skew"]) {
       const v = vecArgs(objProp(lit, key)?.value);
@@ -288,7 +294,12 @@ export function instrument(code, file, nextId) {
     }
     for (const key of ["x", "y", "rotation", "angle", "alpha", "label", "text"]) add(key, objProp(lit, key)?.value);
     if (withTint) add("tint", objProp(lit, "tint")?.value);
-    add("style.fill", objProp(objProp(lit, "style")?.value, "fill")?.value);
+    const style = objProp(lit, "style")?.value;
+    add("style.fill", objProp(style, "fill")?.value);
+    for (const key of STYLE_KEYS) {
+      const v = objProp(style, key)?.value || (!withTint ? objProp(lit, key)?.value : null); // createText({ fontSize: 22 })
+      if (v && v.type !== "ObjectExpression") add(`style.${key}`, v);
+    }
     return opts;
   }
 
@@ -369,6 +380,18 @@ export function instrument(code, file, nextId) {
       // keep going: the children may be creations
     }
 
+    // --- E.state.setAnimation(track, "idle", loop): the spine animation shown
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && propName(node.callee) === "setAnimation") {
+      const stateMember = node.callee.object;
+      const nameArg = node.arguments[1];
+      if (propName(stateMember) === "state" && stateMember.object.type !== "Super" && nameArg && nameArg.type !== "SpreadElement") {
+        const id = nextId("s");
+        sites.push({ id, kind: "animation", form: "call", args: [arg(nameArg)] });
+        wrapObj(stateMember.object, "animation", id);
+      }
+      return;
+    }
+
     // --- E.position.set(a, b)  /  E.scale.set(a) ...
     if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && propName(node.callee) === "set") {
       const vecMember = node.callee.object;
@@ -396,11 +419,11 @@ export function instrument(code, file, nextId) {
         wrapObj(left.object.object, kind, id);
         return;
       }
-      // E.style.fill = v
-      if (prop === "fill" && inner === "style" && left.object.object.type !== "Super") {
+      // E.style.fill = v  /  E.style.fontSize = v
+      if ((prop === "fill" || STYLE_KEYS.includes(prop)) && inner === "style" && left.object.object.type !== "Super") {
         const id = nextId("s");
-        sites.push({ id, kind: "style.fill", form: "assign", args: [arg(node.right)] });
-        wrapObj(left.object.object, "style.fill", id);
+        sites.push({ id, kind: `style.${prop}`, form: "assign", args: [arg(node.right)] });
+        wrapObj(left.object.object, `style.${prop}`, id);
         return;
       }
       // E.x = v  /  E.rotation = v  /  E.scale = v  /  E.text = v

@@ -46,8 +46,9 @@ as usual.
 | **Move tool (V)** | Drag to move (Shift = one axis), corner handles scale (Shift = free X/Y), the round handle above rotates (Shift = 15° steps). Arrow keys = 1 px (Shift = 10 px). |
 | **Pivot tool (P)** | Drag inside the object to place its origin — `anchor` for sprites/texts, `pivot` for everything else. The object stays in place (its position is compensated). Shift snaps to corners/edges/center. |
 | **Hierarchy** | The scene tree. A pink dot means the object is linked to a line of code. **Find** (`Cmd/Ctrl+F`) filters it by name or type; Enter jumps through the matches. Double-click to rename. **Drag a row onto a container** to move the object into it (it stays in the same place on screen), or onto the **top/bottom edge** of a row to draw it before/after that object. The eye hides an object while editing (e.g. a popup covering the screen) — this is never saved. |
-| **Inspector** | Name (saved as the object's `label`), position, scale, rotation, alpha, pivot/anchor with a 3×3 origin grid, and **Appearance**: texture of a sprite, skeleton of a spine, tint, text, text color and shape fill colors. Drag a field's label to scrub the value, like in Unity. Below, the lines of code that control the object. |
+| **Inspector** | Name (saved as the object's `label`), position, scale, rotation, alpha, pivot/anchor with a 3×3 origin grid, and **Appearance**: texture of a sprite, skeleton and animation of a spine, tint, text, text color, font, size, weight, style, alignment, letter spacing and shape fill colors. Drag a field's label to scrub the value, like in Unity. Below, the lines of code that control the object. |
 | **Zoom / pan** | Mouse wheel or pinch zooms around the pointer; Space+drag or middle-drag pans. `F` fits the game, `0` resets to 100%. |
+| **Screen size** | The menu next to the zoom (bottom right) gives the game a phone, tablet, laptop or custom size, to test the layout (and the Anchor component) at other resolutions. Games with a fixed canvas size keep their size. |
 | **Duplicate / Delete** | `Cmd/Ctrl+D` or ⧉ copies the object's code; `Delete` or 🗑 removes it (with a preview of the lines). See [Duplicating and deleting](#duplicating-and-deleting). |
 | **Create** | **+ Create** in the hierarchy: Container, Sprite (pick one of the textures the game has loaded), Text, Rectangle or Circle. See [Creating objects](#creating-objects). |
 | **Components** | "Add component…" in the inspector: **Anchor**, **Button**, **Tween**, or your own **behaviors** (see below). |
@@ -75,6 +76,17 @@ leaderboard.addChild(coin);
 From then on it is a normal object: move, rename, recolor or add components to it and save as usual.
 The container must be stored in a variable in the code. Variable names never clash with existing
 ones (`label`, `label2`…), and the project's quote style and Prettier formatting are respected.
+
+## Text style and spine animation
+
+Texts show **Font, Size, Weight, Style, Align and Spacing**. They are saved where the code defines
+them — `style: { fontSize: 24 }` → `30`, `createText({ fontSize: 40 })` → `46` — or, for an object
+with a variable and no such line, as `scoreText.style.align = "center";` after its creation. A style
+shared through a variable (`style: titleStyle`) is not changed from one object.
+
+Spines show an **Animation** menu with the skeleton's animations; the chosen one plays in a loop while
+you edit. On save, the animation name is written where the code chooses it:
+`spine.state.setAnimation(0, "idle", true)` or `createSpineAnimation({ animationName: "idle" })`.
 
 ## Duplicating and deleting
 
@@ -256,8 +268,6 @@ test/run.js          npm test
 
 ## Next steps
 
-- Spine animation picker (preview animations, rename the one the code plays).
 - Multi-selection and alignment tools.
-- Screen size presets to test layouts.
 - More components (e.g. layout with `@pixi/layout`, sprite animation, sound on click).
-- Font, size and other text style properties.
+- Stroke and drop shadow for texts.
