@@ -1,0 +1,12 @@
+{
+  "name": "fixture-factory",
+  "private": true,
+  "type": "module",
+  "description": "Pixi Editor test fixture (dependencies come from the editor's own node_modules)",
+  "dependencies": {
+    "pixi.js": "*"
+  },
+  "devDependencies": {
+    "vite": "*"
+  }
+}

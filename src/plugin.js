@@ -22,6 +22,7 @@ const PREVIEW_QUERY = "?pixi-editor-preview";
 const PIXI_URL = "/@pixi-editor/pixi.ts";
 const PIXI_ID = "__pixi_editor_pixi.ts?pixi-editor-pixi";
 const BASE = "/__pixi-editor/";
+const EDITOR_DIRS = ["src", "templates", "editor", "bin"].map((d) => path.resolve(HERE, "..", d));
 
 export default function pixiEditor() {
   let root = process.cwd();
@@ -1034,7 +1035,8 @@ export default function pixiEditor() {
       const file = id.split("?")[0];
       if (file === componentsFile()) return null;
       if (!/\.(m?[jt]sx?)$/.test(file) || file.includes("/node_modules/") || !file.startsWith(root)) return null;
-      if (file.startsWith(path.resolve(HERE, ".."))) return null;
+      // The editor's own files (templates, runtime) are never instrumented; its test fixtures are.
+      if (EDITOR_DIRS.some((d) => file.startsWith(d + path.sep))) return null;
       const out = instrument(code, file, nextId);
       if (!out) { register(file, [], [], code); return null; }
       register(file, out.sites, out.decls, code);

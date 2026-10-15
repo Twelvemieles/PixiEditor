@@ -263,8 +263,25 @@ src/runtime.js       Injected into the game: links objects to lines of code
 src/refactor.js      Deleting, duplicating and reordering an object's code
 templates/           pixi-components.ts (copied into projects that use components) and behavior.ts
 editor/              UI (dependency-free HTML/CSS/JS)
-test/run.js          npm test
+test/run.js          npm test (unit tests: instrumenting and rewriting code)
+test/e2e/run.js      npm run e2e (browser tests on the projects in test/fixtures)
 ```
+
+## Development
+
+```bash
+npm install                      # also installs vite, pixi.js, prettier and playwright for the tests
+npx playwright install chromium  # once per machine, for the browser tests
+npm test                         # unit tests (a second)
+npm run e2e                      # browser tests (~30 s)
+```
+
+`npm run e2e` copies the two fixture projects in `test/fixtures` (`basic`: plain `new X()` code;
+`factory`: `createSprite({...})` helpers, `TEX` constants, Prettier with single quotes) to
+`test/.tmp`, starts Pixi Editor on each one, drives it in Chromium and checks the code it writes:
+search, moving, text style, creating, the review dialog, duplicate and delete, parent and draw order,
+textures, and that Prettier-clean files stay clean. `npm run e2e -- factory` runs only the scenarios
+whose name contains "factory"; `HEADED=1 npm run e2e` shows the browser.
 
 ## Next steps
 

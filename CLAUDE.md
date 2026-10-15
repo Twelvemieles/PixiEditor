@@ -8,7 +8,10 @@
 - Projects are chosen inside the app: the top-bar search bar (recent projects + typed path) and the
   Browse button, which opens the OS native folder dialog (`src/server.js → pickFolder`).
 - Keep the editor UI dependency-free (plain HTML/CSS/JS in `editor/`) and runtime deps pure JS.
-- Run `npm test` after changing `src/instrument.js` or `src/writeback.js`.
+- Run `npm test` after changing `src/instrument.js` or `src/writeback.js`, and `npm run e2e` after
+  changing the editor UI, the plugin or the server. Add a scenario to `test/e2e/run.js` for new
+  features (fixtures in `test/fixtures`: `basic` = plain code, `factory` = helper functions).
+- Git is Diego's job: change files only, never commit or push.
 - Components live in `templates/pixi-components.ts` (copied into projects on first use). It must pass
   the team's strict `tsc` and ESLint + Prettier config; run Prettier on it after edits.
 - Always shut down cleanly: closing the project's Vite frees the HMR port (`src/server.js → shutdown`).
