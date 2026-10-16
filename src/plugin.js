@@ -13,11 +13,18 @@ import { analyzeObject, deleteEdits, duplicateEdits, pruneImports, namesIn, move
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNTIME = fs.readFileSync(path.resolve(HERE, "runtime.js"), "utf8");
-const TEMPLATE = path.resolve(HERE, "../templates/pixi-components.ts");
+// Components: one file per component, grouped in category folders (core, layout, ui, animation…),
+// copied into the project's src/pixi-components/ the first time a category is used.
+const COMPONENTS_TEMPLATE = path.resolve(HERE, "../templates/pixi-components");
+const LEGACY_TEMPLATE = path.resolve(HERE, "../templates/legacy/pixi-components.ts");
+const CATALOG = JSON.parse(fs.readFileSync(path.resolve(HERE, "../templates/components-catalog.json"), "utf8"));
+const CATEGORY_OF = new Map(CATALOG.categories.flatMap((c) => c.components.map((comp) => [comp.name, c.id])));
+const BUILTIN_COMPONENTS = new Set(CATEGORY_OF.keys());
+const CORE_EXPORTS = ["addComponent", "useApp"]; // names the editor writes that come from core
 const BEHAVIOR_TEMPLATE = path.resolve(HERE, "../templates/behavior.ts");
-const BUILTIN_COMPONENTS = new Set(["Anchor", "Button", "Tween"]);
 const PREVIEW_URL = "/@pixi-editor/components.ts";
-const PREVIEW_QUERY = "?pixi-editor-preview";
+const PREVIEW_QUERY = "?pixi-editor-preview"; // a template file the project doesn't have yet
+const ALL_QUERY = "?pixi-editor-all"; // the editor's view of every component
 // The project's own pixi.js, for the editor UI (textures list, creating objects live).
 const PIXI_URL = "/@pixi-editor/pixi.ts";
 const PIXI_ID = "__pixi_editor_pixi.ts?pixi-editor-pixi";
@@ -89,19 +96,20 @@ export default function pixiEditor() {
     };
   }
 
-  // Where the generated components module lives in the project.
-  const componentsFile = () => {
-    const dir = fs.existsSync(path.join(root, "src")) ? path.join(root, "src") : root;
-    return path.join(dir, "pixi-components.ts");
-  };
-  const importSpec = (file) => {
-    let rel = path.relative(path.dirname(file), componentsFile().replace(/\.ts$/, "")).split(path.sep).join("/");
+  // Where the components live in the project: src/pixi-components/{core.ts, layout/, ui/, …}
+  const srcDir = () => (fs.existsSync(path.join(root, "src")) ? path.join(root, "src") : root);
+  const componentsDir = () => path.join(srcDir(), "pixi-components");
+  const legacyFile = () => path.join(srcDir(), "pixi-components.ts"); // the old single file
+  /** Import path from `file` to a module of the components folder ("core", "ui", …). */
+  const componentSpec = (file, sub) => {
+    let rel = path.relative(path.dirname(file), path.join(componentsDir(), sub)).split(path.sep).join("/");
     if (!rel.startsWith(".")) rel = `./${rel}`;
     return rel;
   };
+  const inComponents = (file) => file.startsWith(componentsDir() + path.sep);
 
   // ---------------------------------------------------------------- behaviors (per-object scripts)
-  const behaviorsDir = () => path.join(path.dirname(componentsFile()), "behaviors");
+  const behaviorsDir = () => path.join(srcDir(), "behaviors");
   const toUrl = (file) => "/" + path.relative(root, file).split(path.sep).join("/");
   function listBehaviors() {
     const dir = behaviorsDir();
@@ -127,13 +135,121 @@ export default function pixiEditor() {
     }
   }
 
-  /** Writes src/pixi-components.ts if the project doesn't have it yet. Returns true if created. */
-  async function ensureComponentsModule() {
-    if (fs.existsSync(componentsFile())) return false;
-    const code = await formatNew(componentsFile(), fs.readFileSync(TEMPLATE, "utf8"));
-    selfWrites.set(path.normalize(componentsFile()), code); // the game already uses the preview copy: no reload
-    fs.writeFileSync(componentsFile(), code);
-    return true;
+  /** Template files (relative paths) for core and the given categories. */
+  function componentTemplateFiles(categories) {
+    const out = ["core.ts"];
+    for (const cat of categories) {
+      const dir = path.join(COMPONENTS_TEMPLATE, cat);
+      if (fs.existsSync(dir)) for (const f of fs.readdirSync(dir).sort()) out.push(`${cat}/${f}`);
+    }
+    return out;
+  }
+  /** Files the project would get for these categories (relative to the project), without writing. */
+  const missingComponentFiles = (categories) =>
+    componentTemplateFiles(categories).filter((rel) => !fs.existsSync(path.join(componentsDir(), rel))).map((rel) => path.relative(root, path.join(componentsDir(), rel)));
+  /**
+   * Copies core.ts and the given category folders into src/pixi-components/ (only missing files: the
+   * team may have edited theirs). Returns the files created (relative to the project).
+   */
+  async function ensureComponentFiles(categories = []) {
+    const created = [];
+    for (const rel of componentTemplateFiles(categories)) {
+      const dest = path.join(componentsDir(), rel);
+      if (fs.existsSync(dest)) continue;
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      const code = await formatNew(dest, fs.readFileSync(path.join(COMPONENTS_TEMPLATE, rel), "utf8"));
+      selfWrites.set(path.normalize(dest), code); // the game already uses the preview copy: no reload
+      fs.writeFileSync(dest, code);
+      created.push(path.relative(root, dest));
+    }
+    return created;
+  }
+
+  // ---------------------------------------------------------------- migrating the old single file
+  /** Which module of the components folder exports each name ("Anchor" -> "layout", "addComponent" -> "core"). */
+  function componentExportMap() {
+    const map = new Map();
+    for (const rel of componentTemplateFiles(CATALOG.categories.map((c) => c.id))) {
+      if (rel.endsWith("index.ts")) continue;
+      const sub = rel === "core.ts" ? "core" : rel.split("/")[0];
+      const code = fs.readFileSync(path.join(COMPONENTS_TEMPLATE, rel), "utf8");
+      for (const m of code.matchAll(/^export\s+(?:abstract\s+)?(?:class|function|const|let|interface|type)\s+([A-Za-z_$][\w$]*)/gm)) map.set(m[1], sub);
+    }
+    return map;
+  }
+  const normalizeCode = (t) => t.replace(/\s+/g, "").replace(/'/g, '"').replace(/,([)\]}])/g, "$1").replace(/;/g, "");
+
+  /**
+   * Moves a project from src/pixi-components.ts to src/pixi-components/: rewrites every import of the
+   * old file (one import per module: core, layout, ui…), adds the folders it needs and removes the old
+   * file (or keeps it as pixi-components.ts.legacy when the team changed it).
+   */
+  async function migrateComponents({ dryRun = false } = {}) {
+    const legacy = legacyFile();
+    if (!fs.existsSync(legacy)) return { ok: false, error: "This project has no src/pixi-components.ts to migrate." };
+    const exportsOf = componentExportMap();
+    const legacyNoExt = legacy.replace(/\.ts$/, "");
+    const changes = []; // { file, original, code }
+    const categories = new Set();
+    const problems = [];
+    const walkDir = async (dir) => {
+      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (ent.name === "node_modules" || ent.name.startsWith(".") || ent.name === "dist") continue;
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) { if (full !== componentsDir()) await walkDir(full); continue; }
+        if (!/\.(m?[jt]sx?)$/.test(ent.name) || full === legacy) continue;
+        const original = fs.readFileSync(full, "utf8");
+        if (!original.includes("pixi-components")) continue;
+        let ast;
+        try { ast = parse(original, { sourceType: "module", plugins: ["typescript", "decorators-legacy", "jsx"] }); } catch { continue; }
+        const edits = [];
+        for (const decl of ast.program.body) {
+          if (decl.type !== "ImportDeclaration" || !decl.source.value.startsWith(".")) continue;
+          const target = path.resolve(path.dirname(full), decl.source.value).replace(/\.(ts|js)$/, "");
+          if (target !== legacyNoExt) continue;
+          const groups = new Map();
+          for (const sp of decl.specifiers) {
+            if (sp.type !== "ImportSpecifier") { problems.push(`${path.relative(root, full)}: "${original.slice(decl.start, decl.end)}" can't be split automatically.`); continue; }
+            const name = sp.imported.name || sp.imported.value;
+            const sub = exportsOf.get(name);
+            if (!sub) { problems.push(`${path.relative(root, full)}: "${name}" doesn't exist in the new components (it was only used by the editor).`); continue; }
+            if (sub !== "core") categories.add(sub);
+            const local = sp.local.name !== name ? `${name} as ${sp.local.name}` : name;
+            if (!groups.has(sub)) groups.set(sub, []);
+            groups.get(sub).push(sp.importKind === "type" && decl.importKind !== "type" ? `type ${local}` : local);
+          }
+          const q = original[decl.source.start];
+          const order = ["core", ...CATALOG.categories.map((c) => c.id)];
+          const lineStart = original.lastIndexOf("\n", decl.start - 1) + 1;
+          const indent = /^[ \t]*/.exec(original.slice(lineStart))[0];
+          const text = [...groups].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))
+            .map(([sub, names]) => `import ${decl.importKind === "type" ? "type " : ""}{ ${names.join(", ")} } from ${q}${componentSpec(full, sub)}${q};`)
+            .join(`\n${indent}`);
+          edits.push({ start: decl.start, end: decl.end, text });
+        }
+        if (!edits.length) continue;
+        const code = applyText(original, edits);
+        changes.push({ file: full, original, code: (await formatLikeProject(full, original, code)) || code });
+      }
+    };
+    await walkDir(srcDir());
+    if (problems.length) return { ok: false, error: `Can't migrate automatically:\n${problems.join("\n")}` };
+    const legacyChanged = normalizeCode(fs.readFileSync(legacy, "utf8")) !== normalizeCode(fs.readFileSync(LEGACY_TEMPLATE, "utf8"));
+    const rel = (f) => path.relative(root, f);
+    const summary = {
+      ok: true,
+      diffs: changes.map((c) => ({ file: rel(c.file), hunks: lineDiff(c.original, c.code) })),
+      newFiles: missingComponentFiles(categories),
+      legacy: rel(legacy),
+      legacyChanged,
+      keptAs: legacyChanged ? `${rel(legacy)}.legacy` : null,
+    };
+    if (dryRun) return summary;
+    await ensureComponentFiles(categories);
+    for (const c of changes) fs.writeFileSync(c.file, c.code);
+    if (legacyChanged) fs.renameSync(legacy, `${legacy}.legacy`);
+    else fs.unlinkSync(legacy);
+    return summary;
   }
 
   /** Creates src/behaviors/<Name>.ts from the template. */
@@ -145,13 +261,13 @@ export default function pixiEditor() {
     if (created) {
       fs.mkdirSync(behaviorsDir(), { recursive: true });
       let code = fs.readFileSync(BEHAVIOR_TEMPLATE, "utf8")
-        .replaceAll("__COMPONENTS__", path.relative(path.dirname(file), componentsFile().replace(/\.ts$/, "")).split(path.sep).join("/").replace(/^(?!\.)/, "./"))
+        .replaceAll("__COMPONENTS__", componentSpec(file, "core"))
         .replaceAll("__NAME__", name)
         .replaceAll("__OBJECT__", String(objectName || name).replace(/["\n]/g, ""));
       code = await formatNew(file, code);
       fs.writeFileSync(file, code);
     }
-    const createdModule = await ensureComponentsModule();
+    const createdModule = (await ensureComponentFiles([])).length > 0;
     return { name, url: toUrl(file), file: path.relative(root, file), abs: file, created, createdModule };
   }
 
@@ -938,6 +1054,10 @@ export default function pixiEditor() {
         if (/\buseApp\s*\(/.test(fs.readFileSync(decl.file, "utf8"))) continue;
         b.names.add("useApp");
       }
+      if (e.kind.startsWith("component:") && fs.existsSync(legacyFile())) {
+        result.errors.push("This project still uses the old src/pixi-components.ts: migrate it first (Components → Migrate…).");
+        continue;
+      }
       if (e.kind.startsWith("component:")) {
         const type = e.kind.slice(10);
         if (!BUILTIN_COMPONENTS.has(type) && !listBehaviors().some((bh) => bh.name === type)) {
@@ -960,7 +1080,8 @@ export default function pixiEditor() {
       b.inserts.push(ins);
     }
 
-    let needsModule = false;
+    const neededCategories = new Set();
+    let needsCore = false;
     for (const [file, { siteEdits, inserts, names }] of perFile) {
       const original = fs.readFileSync(file, "utf8");
       const ctx = { quote: detectQuote(original), failed: result.failed, pixiNames: new Set() };
@@ -977,14 +1098,18 @@ export default function pixiEditor() {
       const touchesComponents = names.size || siteEdits.some((e) => e.remove);
       if (touchesComponents) {
         const scratch = { applied: [], inserted: [], saved: 0 };
-        const builtin = [...names].filter((n) => !listBehaviors().some((bh) => bh.name === n));
-        const imp = planImport(code, importSpec(file), builtin);
-        if (imp) code = apply(file, code, [imp], scratch);
+        // core (addComponent, useApp) and one import per category: { Anchor } from ".../layout"
+        const modules = [["core", (n) => CORE_EXPORTS.includes(n)], ...CATALOG.categories.map((c) => [c.id, (n) => CATEGORY_OF.get(n) === c.id])];
+        for (const [sub, owns] of modules) {
+          const imp = planImport(code, componentSpec(file, sub), [...names].filter(owns));
+          if (imp) code = apply(file, code, [imp], scratch);
+        }
         for (const bh of listBehaviors()) {
           const bimp = planImport(code, behaviorSpec(file, bh.file), names.has(bh.name) ? [bh.name] : []);
           if (bimp) code = apply(file, code, [bimp], scratch);
         }
-        if (names.size) needsModule = true;
+        if (names.size) needsCore = true;
+        for (const n of names) if (CATEGORY_OF.has(n)) neededCategories.add(CATEGORY_OF.get(n));
       }
       const formatted = await formatLikeProject(file, original, code);
       if (dryRun) {
@@ -998,12 +1123,12 @@ export default function pixiEditor() {
     }
 
     if (dryRun) {
-      if (needsModule && !fs.existsSync(componentsFile())) result.newFiles = [path.relative(root, componentsFile())];
+      if (needsCore) result.newFiles = missingComponentFiles(neededCategories);
       return result;
     }
-    if (needsModule && (await ensureComponentsModule())) {
-      result.files.push(path.relative(root, componentsFile()));
-      result.createdModule = true;
+    if (needsCore) {
+      const created = await ensureComponentFiles(neededCategories);
+      if (created.length) { result.files.push(...created); result.createdModule = true; }
     }
     result.ok = result.errors.length === 0;
     return result;
@@ -1024,14 +1149,40 @@ export default function pixiEditor() {
     },
 
     // Live preview of the components module before it exists in the project.
-    resolveId(id) {
-      if (id === PREVIEW_URL) return componentsFile() + PREVIEW_QUERY;
+    resolveId(id, importer) {
+      if (id === PREVIEW_URL) return path.join(componentsDir(), "__editor_all__.ts") + ALL_QUERY;
+      // Inside the editor's view of the components: use the project's file when it exists,
+      // otherwise the template (not copied into the project yet).
+      if (importer && (importer.endsWith(PREVIEW_QUERY) || importer.endsWith(ALL_QUERY)) && id.startsWith(".")) {
+        let abs = path.resolve(path.dirname(importer.split("?")[0]), id);
+        if (!/\.ts$/.test(abs)) abs += ".ts";
+        if (fs.existsSync(abs)) return abs;
+        const tpl = path.join(COMPONENTS_TEMPLATE, path.relative(componentsDir(), abs));
+        if (inComponents(abs) && fs.existsSync(tpl)) return abs + PREVIEW_QUERY;
+        return null;
+      }
       if (id === PIXI_URL) return path.join(root, PIXI_ID);
       if (id === SPINE_URL) return path.join(root, SPINE_ID);
       return null;
     },
     load(id) {
-      if (id === componentsFile() + PREVIEW_QUERY) return fs.readFileSync(TEMPLATE, "utf8");
+      if (id.endsWith(ALL_QUERY) && id.startsWith(componentsDir())) {
+        // Every component (project copy or template), plus a name -> class map for the editor.
+        const lines = ['export * from "./core.ts";'];
+        const names = [];
+        for (const cat of CATALOG.categories) {
+          const list = cat.components.map((c) => c.name);
+          lines.push(`import { ${list.join(", ")} } from "./${cat.id}/index.ts";`);
+          names.push(...list);
+        }
+        lines.push(`export const componentTypes = { ${names.join(", ")} };`);
+        lines.push(`export const catalog = ${JSON.stringify(CATALOG)};`);
+        return lines.join("\n") + "\n";
+      }
+      if (id.endsWith(PREVIEW_QUERY) && id.startsWith(componentsDir())) {
+        const rel = path.relative(componentsDir(), id.slice(0, -PREVIEW_QUERY.length));
+        return fs.readFileSync(path.join(COMPONENTS_TEMPLATE, rel), "utf8");
+      }
       if (id === path.join(root, PIXI_ID)) return 'export * from "pixi.js";\n';
       if (id === path.join(root, SPINE_ID)) {
         const req = createRequire(path.join(root, "package.json"));
@@ -1050,7 +1201,7 @@ export default function pixiEditor() {
 
     transform(code, id) {
       const file = id.split("?")[0];
-      if (file === componentsFile()) return null;
+      if (inComponents(file) || file === legacyFile()) return null; // components are the editor's own code
       if (!/\.(m?[jt]sx?)$/.test(file) || file.includes("/node_modules/") || !file.startsWith(root)) return null;
       // The editor's own files (templates, runtime) are never instrumented; its test fixtures are.
       if (EDITOR_DIRS.some((d) => file.startsWith(d + path.sep))) return null;
@@ -1080,12 +1231,12 @@ export default function pixiEditor() {
           return res.end(JSON.stringify(out));
         }
         if (url.pathname === `${BASE}api/components`) {
-          const exists = fs.existsSync(componentsFile());
           res.setHeader("Content-Type", "application/json");
           return res.end(JSON.stringify({
-            exists,
-            url: exists ? toUrl(componentsFile()) : PREVIEW_URL,
-            file: path.relative(root, componentsFile()),
+            url: PREVIEW_URL,
+            dir: path.relative(root, componentsDir()),
+            catalog: CATALOG,
+            legacy: fs.existsSync(legacyFile()) ? path.relative(root, legacyFile()) : null,
             behaviors: listBehaviors().map(({ name, url: u, rel }) => ({ name, url: u, file: rel })),
           }));
         }
@@ -1109,6 +1260,13 @@ export default function pixiEditor() {
         if (url.pathname === `${BASE}api/behavior` && req.method === "POST") {
           readJson().then(async (b) => {
             try { sendJson({ ok: true, ...(await createBehavior(b.name, b.objectName)) }); }
+            catch (err) { sendJson({ ok: false, error: String(err.message || err) }); }
+          });
+          return;
+        }
+        if (url.pathname === `${BASE}api/migrate-components` && req.method === "POST") {
+          readJson().then(async (b) => {
+            try { sendJson(await migrateComponents(b)); }
             catch (err) { sendJson({ ok: false, error: String(err.message || err) }); }
           });
           return;

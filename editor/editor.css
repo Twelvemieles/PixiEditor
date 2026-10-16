@@ -499,3 +499,55 @@ input.obj-name:focus { outline: none; border-color: var(--sel); background: var(
 .anim-list .anim.on { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
 .spine-info { padding: 4px 12px 12px; word-break: break-all; }
 .audio-controls .time { white-space: nowrap; }
+
+/* new project */
+.welcome-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.ghost.big { padding: 9px 18px; font-size: 13px; }
+.new-card { width: min(560px, 92vw); display: flex; flex-direction: column; gap: 12px; }
+.new-form { display: flex; flex-direction: column; gap: 10px; }
+.new-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
+.new-form label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); }
+.new-form input[type="text"] {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text);
+  padding: 7px 9px; font: 13px var(--mono);
+}
+.new-form input[type="text"]:focus { outline: none; border-color: var(--sel); }
+.new-loc { display: flex; gap: 6px; }
+.new-loc input { flex: 1; min-width: 0; }
+.new-path { margin: -4px 0 0; font: 11px var(--mono); word-break: break-all; }
+.new-progress { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 10px 0; }
+.new-progress.hidden, .new-form.hidden { display: none; }
+.new-progress pre {
+  align-self: stretch; max-height: 180px; overflow: auto; margin: 0; padding: 8px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--line); font: 11px/1.4 var(--mono); color: var(--dim); white-space: pre-wrap;
+}
+.spinner { width: 26px; height: 26px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.actions .hidden { display: none; }
+.job-actions { align-self: stretch; }
+.job-actions .note { flex: 1; margin: 0; }
+.job-actions code { font: 11px var(--mono); }
+.welcome-error button { margin-top: 8px; }
+
+/* --- Game URL bar (top of the scene) --- */
+.scene-col { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.scene-col > .viewport { flex: 1; }
+.urlbar { flex: none; }
+.urlbar {
+  display: flex; align-items: center; gap: 0; height: 30px; padding: 0 6px 0 10px;
+  background: var(--panel); border-bottom: 1px solid var(--line); font: 12px var(--mono); min-width: 0;
+}
+.urlbar.hidden { display: none; }
+.urlbar .url-origin { color: var(--faint); white-space: nowrap; flex: none; }
+.urlbar input {
+  flex: 1; min-width: 0; background: transparent; border: 1px solid transparent; border-radius: 5px;
+  color: var(--text); font: inherit; padding: 3px 4px; outline: none;
+}
+.urlbar input:hover { border-color: var(--line); }
+.urlbar input:focus { border-color: var(--accent); background: var(--bg); }
+.urlbar input.edited { color: var(--warn); }
+.urlbar button {
+  flex: none; background: transparent; border: 0; color: var(--faint); padding: 2px 6px; border-radius: 4px; font-size: 11px;
+}
+.urlbar button:hover { color: var(--text); background: var(--panel-2); }
+.urlbar button.hidden { display: none; }

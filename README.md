@@ -23,6 +23,16 @@ npm install                     # first time only
 node bin/pixi-editor.js         # opens http://localhost:5180/__pixi-editor/
 ```
 
+**macOS without the Terminal:** double-click **`PixiEditor.app`** in this folder (drag it to the Dock to
+keep it there; it has to stay in this folder, the Dock only keeps a shortcut). It finds Node.js by itself
+(nvm, Homebrew, Volta, fnm, asdf or nodejs.org), runs `npm install` the first time and whenever
+`package-lock.json` changes, starts the editor in the background and opens the browser. If the editor is
+already running it just opens the browser again; **Quit** in the editor's top bar stops it. Problems show
+up as a dialog, and the log is in `~/.pixi-editor/editor.log`. `pixi-editor.command` does the same in a
+visible Terminal window (Ctrl+C stops it). If Node.js is somewhere unusual, put the full path of the
+`node` binary in `~/.pixi-editor/node-path`. The first time, macOS may ask to confirm opening it
+(right-click → Open).
+
 Pick a project inside the editor:
 
 - **Search bar** (top bar, `Cmd/Ctrl+P`): filters recent projects as you type; paste or type a folder
@@ -30,12 +40,24 @@ Pick a project inside the editor:
 - **Browse…** (`Cmd/Ctrl+O`): opens the system folder picker (Finder on macOS, the folder dialog on
   Windows, zenity/kdialog on Linux).
 
+Or start a new one: **＋ New project…** on the start screen asks for a name and a location (with
+the system folder picker), writes a Vite + PixiJS v8 + TypeScript game with a first scene (optionally
+with ESLint + Prettier), runs `npm install` and opens it. Network errors during `npm install` are retried automatically, and
+packages already in npm's cache are reused; if it still fails, **Retry** tries again. Opening a project
+that has no `node_modules` offers **Install dependencies** too. **⌂ Close project** in the top bar stops the
+project and goes back to the start screen.
+
 You can also pass a project directly: `node bin/pixi-editor.js ~/pixi/firstProject`.
 Options: `--port 5200`, `--no-open`. Recent projects are stored in `~/.pixi-editor/recent.json`.
 
 The project's own configuration is never modified: the editor runs the project's own Vite with the
 editor plugin added. If the game needs a backend (e.g. the WebSocket server in `server/`), start it
 as usual.
+
+**Game URL bar** (top of the scene): shows the URL the game runs at. Type query parameters
+(`?lang=es&token=abc`, or just `lang=es&token=abc`) and press Enter to reload the game with them; Esc
+reverts and ✕ removes them. The URL is remembered per project, with the last ones you used as
+suggestions, and changes the game makes itself (`history.replaceState`) show up in the bar.
 
 ## Working in the editor
 
@@ -170,26 +192,51 @@ and the game reloads by itself to run with it. A spine chosen by an expression
 
 ## Components
 
-Components add reusable behaviour to any object, from the inspector:
+Components add reusable behaviour to any object, from the inspector ("Add component…", grouped by
+category):
 
-| Component | What it does | Params |
+| Category · Component | What it does | Params |
 |---|---|---|
-| **Anchor** | Keeps the object at a fixed offset from a screen edge or corner (follows screen resizes). Dragging an anchored object edits its offset. | `h` left/center/right, `v` top/middle/bottom, `x`, `y` |
-| **Button** | Pointer cursor plus hover/press scale feedback. Handle clicks in code: `obj.on("pointertap", …)`. | `hoverScale`, `pressScale`, `cursor` |
-| **Tween** | Looping idle animation on top of the object's values (paused in Edit mode). | `kind` pulse/float/spin/fade, `amount`, `speed` |
+| Layout · **Anchor** | Keeps the object at a fixed offset from a screen edge or corner (follows screen resizes). Dragging an anchored object edits its offset. | `h` left/center/right, `v` top/middle/bottom, `x`, `y` |
+| UI · **Button** | Pointer cursor plus hover/press scale feedback. Handle clicks in code: `obj.on("pointertap", …)`. | `hoverScale`, `pressScale`, `cursor` |
+| Animation · **Tween** | Looping idle animation on top of the object's values (paused in Edit mode). | `kind` pulse/float/spin/fade, `amount`, `speed` |
 
-On save, components are written as plain code right after the object is created, and the import is
-kept in sync:
+On save, components are written as plain code right after the object is created, with one import
+per category (kept in sync):
 
 ```ts
-import { addComponent, Anchor } from "../pixi-components";
+import { addComponent } from "../pixi-components/core";
+import { Anchor } from "../pixi-components/layout";
 // …
 addComponent(netText, Anchor, { h: "right", v: "top", x: -30, y: 10 });
 ```
 
-The first time a component is saved, the editor adds `src/pixi-components.ts` to the project (strict
-TypeScript, readable, safe to edit and commit) and, for Anchor, a `useApp(app);` line after the
-Application is created. Removing a component deletes its line (and the import name when unused).
+The components live in the project, one file each, grouped by category:
+
+```
+src/pixi-components/
+  core.ts            Component, addComponent, getComponent, removeComponent, useApp…
+  layout/            index.ts + Anchor.ts
+  ui/                index.ts + Button.ts
+  animation/         index.ts + Tween.ts
+```
+
+`core.ts` and a category's folder are added the first time one of its components is saved — a project
+that only uses Anchor gets `core.ts` and `layout/` only. The files are strict TypeScript, formatted
+with the project's Prettier, safe to edit and commit; the editor never overwrites them. Unused
+components are left out of the game's build (each category's `index.ts` only re-exports). For Anchor,
+a `useApp(app);` line is also added after the Application is created. Removing a component deletes
+its line (and the import when nothing else uses it).
+
+**Projects from older versions** have a single `src/pixi-components.ts`. The inspector shows
+**Migrate…**: it previews and rewrites every import of that file (`{ addComponent, Button } from
+"./pixi-components"` → core + ui), adds the folders in use and removes the old file — or keeps it as
+`pixi-components.ts.legacy` if it had changes of yours.
+
+**Adding a built-in component** (for editor developers): add its file to a category folder in
+`templates/pixi-components/` (or a new folder), export it from that folder's `index.ts`, and describe
+its fields in `templates/components-catalog.json`. The editor's menu and inspector are built from that
+catalog.
 
 ## Behaviors (your own code per object)
 
@@ -273,13 +320,16 @@ Object.assign(createText({ text: i18n.t('common.balance'), … }), { label: 'Bal
 
 ```
 bin/pixi-editor.js   CLI
+PixiEditor.app       macOS launcher (Contents/MacOS/launcher is a bash script); pixi-editor.command
+scripts/             app-icon.svg (app icon + favicon source) and build-app-icon.js (npm run build:icon)
 src/server.js        Editor server: UI, project picker, hosts the project's Vite (same origin)
 src/plugin.js        Vite plugin: instruments code, injects the runtime, saves changes
 src/instrument.js    Parses code (Babel) and marks the code site of each property
 src/writeback.js     Computes text edits ("adjust only the number")
 src/runtime.js       Injected into the game: links objects to lines of code
 src/refactor.js      Deleting, duplicating and reordering an object's code
-templates/           pixi-components.ts (copied into projects that use components) and behavior.ts
+templates/           pixi-components/ (components, copied into projects by category),
+                     components-catalog.json (their inspector fields), behavior.ts, new-project/
 editor/              UI (dependency-free HTML/CSS/JS)
 test/run.js          npm test (unit tests: instrumenting and rewriting code)
 test/e2e/run.js      npm run e2e (browser tests on the projects in test/fixtures)

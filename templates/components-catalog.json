@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "categories": [
+    {
+      "id": "layout",
+      "label": "Layout",
+      "components": [
+        {
+          "name": "Anchor",
+          "help": "Keeps the object at a fixed offset from a screen edge or corner. Dragging the object edits the offset.",
+          "fields": [
+            { "key": "h", "label": "Horizontal", "type": "select", "options": ["left", "center", "right"] },
+            { "key": "v", "label": "Vertical", "type": "select", "options": ["top", "middle", "bottom"] },
+            { "key": "x", "label": "Offset X", "type": "number", "step": 1 },
+            { "key": "y", "label": "Offset Y", "type": "number", "step": 1 }
+          ],
+          "needsApp": true
+        }
+      ]
+    },
+    {
+      "id": "ui",
+      "label": "UI",
+      "components": [
+        {
+          "name": "Button",
+          "help": "Pointer cursor plus hover and press feedback. Handle clicks in code with target.on(\"pointertap\", …).",
+          "fields": [
+            { "key": "hoverScale", "label": "Hover scale", "type": "number", "step": 0.01 },
+            { "key": "pressScale", "label": "Press scale", "type": "number", "step": 0.01 },
+            { "key": "cursor", "label": "Cursor", "type": "select", "options": ["pointer", "default", "grab", "help"] }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "animation",
+      "label": "Animation",
+      "components": [
+        {
+          "name": "Tween",
+          "help": "Looping idle animation on top of the object's values. Paused in Edit mode — switch to Play to preview.",
+          "fields": [
+            { "key": "kind", "label": "Kind", "type": "select", "options": ["pulse", "float", "spin", "fade"] },
+            { "key": "amount", "label": "Amount", "type": "number", "step": 0.01 },
+            { "key": "speed", "label": "Speed", "type": "number", "step": 0.05 }
+          ]
+        }
+      ]
+    }
+  ]
+}

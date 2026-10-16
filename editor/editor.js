@@ -145,35 +145,17 @@ const INSERT_GROUP = {
 };
 
 // ---------------------------------------------------------------- components
-const COMPONENT_TYPES = ["Anchor", "Button", "Tween"];
+// Built-in components come from the editor's catalog (templates/components-catalog.json), grouped
+// in categories (layout, ui, animation…). Filled in when the game connects.
+let COMPONENT_TYPES = [];
+let COMPONENT_CATEGORIES = []; // [{ id, label, components: [{ name, help, fields, needsApp }] }]
+let SCHEMAS = {};
 const TWEEN_AMOUNT = { pulse: 0.05, float: 6, spin: 1, fade: 0.5 };
-const SCHEMAS = {
-  Anchor: {
-    help: "Keeps the object at a fixed offset from a screen edge or corner. Dragging the object edits the offset.",
-    fields: [
-      { key: "h", label: "Horizontal", type: "select", options: ["left", "center", "right"] },
-      { key: "v", label: "Vertical", type: "select", options: ["top", "middle", "bottom"] },
-      { key: "x", label: "Offset X", type: "number", step: 1 },
-      { key: "y", label: "Offset Y", type: "number", step: 1 },
-    ],
-  },
-  Button: {
-    help: "Pointer cursor plus hover and press feedback. Handle clicks in code with target.on(\"pointertap\", …).",
-    fields: [
-      { key: "hoverScale", label: "Hover scale", type: "number", step: 0.01 },
-      { key: "pressScale", label: "Press scale", type: "number", step: 0.01 },
-      { key: "cursor", label: "Cursor", type: "select", options: ["pointer", "default", "grab", "help"] },
-    ],
-  },
-  Tween: {
-    help: "Looping idle animation on top of the object's values. Paused in Edit mode — switch to Play to preview.",
-    fields: [
-      { key: "kind", label: "Kind", type: "select", options: ["pulse", "float", "spin", "fade"] },
-      { key: "amount", label: "Amount", type: "number", step: 0.01 },
-      { key: "speed", label: "Speed", type: "number", step: 0.05 },
-    ],
-  },
-};
+function setCatalog(catalog) {
+  COMPONENT_CATEGORIES = (catalog && catalog.categories) || [];
+  COMPONENT_TYPES = COMPONENT_CATEGORIES.flatMap((c) => c.components.map((comp) => comp.name));
+  SCHEMAS = Object.fromEntries(COMPONENT_CATEGORIES.flatMap((c) => c.components.map((comp) => [comp.name, comp])));
+}
 
 const compName = (c) => c.constructor.componentName;
 function compList(obj) {
@@ -308,6 +290,8 @@ async function loadComponents() {
     const mod = await win.eval(`import(${JSON.stringify(info.url)})`);
     if (state.win !== win) return;
     state.compMod = mod;
+    setCatalog(info.catalog || mod.catalog);
+    state.componentsLegacy = info.legacy || null;
     state.behaviors = info.behaviors || [];
     state.PIXI = await win.eval(`import("/@pixi-editor/pixi.ts")`);
     mod.useApp(state.app);
@@ -724,7 +708,7 @@ function buildSave() {
     else if (!site && c.current && meta && meta.declId) {
       inserts.set(`${meta.declId}:${kind}`, { declId: meta.declId, kind, params: c.current, obj: c.obj });
       compPlan.push({ c, target: meta.declId });
-      if (c.type === "Anchor") {
+      if (SCHEMAS[c.type] && SCHEMAS[c.type].needsApp) {
         const appDecl = state.pe.appDecls && state.pe.appDecls.get(state.app);
         if (appDecl) inserts.set(`${appDecl.declId}:useApp`, { declId: appDecl.declId, kind: "useApp" });
       }
@@ -975,7 +959,7 @@ async function openReview() {
     if (unsaved.length) msg(`Can't be saved (no code line): ${[...new Set(unsaved)].join(", ")}`, "err");
     const shared = [...siteEdits.keys()].filter((id) => (state.pe.siteUse.get(id) || 0) > 1);
     if (shared.length) msg(`${shared.length} of these lines create or move several objects (up to ${Math.max(...shared.map((id) => state.pe.siteUse.get(id)))}): the change applies to all of them.`);
-    for (const f of res.newFiles || []) msg(`New file: ${f} (the components module).`);
+    for (const f of res.newFiles || []) msg(`New file: ${f}`);
     renderDiffs(diffBox, res.diffs);
     if (!diffBox.children.length) diffBox.innerHTML = `<p class="note" style="padding:10px">No code changes.</p>`;
   };
@@ -2037,7 +2021,10 @@ function renderComponents(o) {
   add.className = "comp-add";
   add.innerHTML =
     `<option value="">+ Add component…</option>` +
-    (available.length ? `<optgroup label="Components">${available.map((t) => `<option value="${t}">${t}</option>`).join("")}</optgroup>` : "") +
+    COMPONENT_CATEGORIES.map((cat) => {
+      const list = cat.components.map((c) => c.name).filter((t) => available.includes(t));
+      return list.length ? `<optgroup label="${escapeHtml(cat.label)}">${list.map((t) => `<option value="${t}">${t}</option>`).join("")}</optgroup>` : "";
+    }).join("") +
     `<optgroup label="Behaviors (your code)">${behaviors.map((b) => `<option value="behavior:${escapeHtml(b.name)}">${escapeHtml(b.name)}</option>`).join("")}<option value="new">New behavior…</option></optgroup>`;
   add.onchange = async () => {
     const v = add.value;
@@ -2063,6 +2050,15 @@ function renderComponents(o) {
     addComponentTo(o, v);
   };
   sec.appendChild(add);
+  if (state.componentsLegacy) {
+    // Old projects: one src/pixi-components.ts. Components are now one file each, in category folders.
+    const n = document.createElement("div");
+    n.className = "note warn legacy-note";
+    n.innerHTML = `<span></span> <button class="ghost">Migrate…</button>`;
+    n.querySelector("span").textContent = `This project uses the old ${state.componentsLegacy}. Migrate it to the new src/pixi-components/ folders to save components.`;
+    n.querySelector("button").onclick = migrateComponents;
+    sec.appendChild(n);
+  }
   const removedNotes = changes.filter((c) => !c.current);
   if (removedNotes.length) sec.insertAdjacentHTML("beforeend", `<p class="note">Removed (not saved yet): ${removedNotes.map((c) => c.type).join(", ")}</p>`);
   const m = metaOf(o);
@@ -2235,6 +2231,8 @@ const looksLikePath = (q) => /^(\/|~|[A-Za-z]:[\\/])/.test(q);
 async function loadState() {
   const st = await (await fetch("/__pixi-editor/api/state")).json();
   state.recent = st.recent || [];
+  state.home = st.home || "";
+  state.platform = st.platform || "";
   renderWelcomeRecent();
   if (st.project) showProject(st.project, false);
 }
@@ -2246,6 +2244,7 @@ function showProject(project, reloadGame = true) {
   projectInput.title = project.path;
   document.title = `Pixi Editor — ${project.name}`;
   welcome.classList.add("hidden");
+  $("#btn-close-project").classList.remove("hidden");
   if (changed) {
     filesState.expanded = new Set([""]);
     filesState.cache.clear();
@@ -2256,7 +2255,8 @@ function showProject(project, reloadGame = true) {
   if (changed || reloadGame) {
     state.expanded = new WeakSet();
     select(null);
-    iframe.setAttribute("src", `/?pixi-editor=${Date.now()}`);
+    showUrlBar();
+    loadGame(savedGameUrl(), true);
   }
   const warn = project.warnings && project.warnings.length ? ` · ${project.warnings.join(" ")}` : "";
   setStatus(`Opened ${project.name}${warn}`, warn ? "err" : "ok");
@@ -2275,8 +2275,13 @@ async function openProject(path) {
   })).json();
   if (!res.ok) {
     setStatus(res.error, "err");
-    if (!state.project) $("#welcome-error").textContent = res.error;
     projectInput.value = state.project ? state.project.path : path;
+    // No node_modules yet (e.g. created while offline): offer to install them here.
+    if (/not installed|npm install/i.test(res.error)) {
+      offerInstall(path, res.error);
+      return;
+    }
+    if (!state.project) $("#welcome-error").textContent = res.error;
     return;
   }
   state.pending.clear(); updateSaveButton();
@@ -3227,6 +3232,115 @@ iframe.addEventListener("load", applyMute);
 applyMute();
 
 
+// ---------------------------------------------------------------- game URL bar
+// Games often read settings from the page URL (?lang=es&token=…). The bar shows the URL the game runs
+// at and lets you add parameters; the URL is remembered per project (with a short history).
+const URL_KEY = "pixi-editor:game-url"; // { [projectPath]: { url, recent: [] } }
+const urlBar = $("#urlbar");
+const urlInput = $("#url-input");
+const urlClear = $("#url-clear");
+$("#url-origin").textContent = location.host;
+function urlStore() {
+  try { return JSON.parse(localStorage.getItem(URL_KEY) || "{}") || {}; } catch { return {}; }
+}
+function projectUrlEntry() {
+  const e = state.project && urlStore()[state.project.path];
+  return { url: "/", recent: [], ...(e || {}) };
+}
+function savedGameUrl() { return projectUrlEntry().url || "/"; }
+function rememberGameUrl(url) {
+  if (!state.project) return;
+  const all = urlStore();
+  const e = projectUrlEntry();
+  e.url = url;
+  if (url !== "/") e.recent = [url, ...e.recent.filter((u) => u !== url)].slice(0, 10);
+  all[state.project.path] = e;
+  try { localStorage.setItem(URL_KEY, JSON.stringify(all)); } catch { /* private mode */ }
+  renderUrlRecent();
+}
+function renderUrlRecent() {
+  const list = $("#url-recent");
+  list.innerHTML = "";
+  for (const u of projectUrlEntry().recent) {
+    const o = document.createElement("option");
+    o.value = u;
+    list.appendChild(o);
+  }
+}
+/** Accepts a full URL, a path, "?a=1", "#x" or just "a=1&b=2"; returns path + query + hash. */
+function normalizeGameUrl(text) {
+  let t = text.trim();
+  if (!t) return "/";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) {
+    try { const u = new URL(t); return u.pathname + u.search + u.hash; } catch { return null; }
+  }
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?([/?#]|$)/i.test(t)) t = t.replace(/^[^/?#]*/, "");
+  if (!t) return "/";
+  if (t.startsWith("?") || t.startsWith("#")) return "/" + t;
+  if (t.startsWith("/")) return t;
+  return t.includes("=") && !t.includes("/") ? `/?${t}` : `/${t}`;
+}
+/** The URL the game page is at right now (it may change it itself, e.g. history.replaceState). */
+function currentGameUrl() {
+  try {
+    const l = iframe.contentWindow.location;
+    if (!iframe.getAttribute("src") || l.href === "about:blank") return null;
+    return l.pathname + l.search + l.hash;
+  } catch { return null; }
+}
+function showGameUrl(url) {
+  if (document.activeElement === urlInput) return; // don't fight the person typing
+  if (urlInput.value !== url) urlInput.value = url;
+  urlInput.classList.remove("edited");
+  urlClear.classList.toggle("hidden", url === "/");
+}
+function showUrlBar() {
+  urlBar.classList.remove("hidden");
+  renderUrlRecent();
+  showGameUrl(savedGameUrl());
+}
+/** Loads the game at `url` (always a fresh page load, even when only the #hash differs). */
+function loadGame(url, force = false) {
+  if (!force && pendingCount() && !window.confirm("You have unsaved changes. Reload the game anyway?")) {
+    showGameUrl(currentGameUrl() || savedGameUrl());
+    return false;
+  }
+  rememberGameUrl(url);
+  const cur = currentGameUrl();
+  if (cur && cur.split("#")[0] === url.split("#")[0]) {
+    iframe.contentWindow.location.replace(url); // same document: only the hash would change…
+    iframe.contentWindow.location.reload(); // …so reload it explicitly
+  } else {
+    iframe.setAttribute("src", url);
+  }
+  showGameUrl(url);
+  return true;
+}
+urlInput.addEventListener("input", () => urlInput.classList.add("edited"));
+urlInput.addEventListener("keydown", (e) => {
+  e.stopPropagation(); // typing here never triggers editor shortcuts
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const url = normalizeGameUrl(urlInput.value);
+    if (url == null) { setStatus("That isn't a valid URL", "err"); return; }
+    urlInput.blur();
+    if (loadGame(url)) setStatus(`Reloading the game at ${url}…`);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    urlInput.blur();
+  }
+});
+urlInput.addEventListener("focus", () => setTimeout(() => urlInput.select(), 0));
+urlInput.addEventListener("blur", () => showGameUrl(currentGameUrl() || savedGameUrl()));
+urlClear.onclick = () => { if (loadGame("/")) setStatus("Reloading the game without parameters…"); };
+iframe.addEventListener("load", () => { const u = currentGameUrl(); if (u) showGameUrl(u); });
+// The game may change its own URL without reloading (pushState / replaceState / #hash).
+setInterval(() => {
+  if (urlBar.classList.contains("hidden")) return;
+  const u = currentGameUrl();
+  if (u && u !== urlInput.value) showGameUrl(u);
+}, 700);
+
 // ---------------------------------------------------------------- file previews in the inspector
 const TEXT_EXT = /\.(m?[jt]sx?|cjs|json|fnt|md|txt|css|scss|html?|atlas|xml|ya?ml|csv|glsl|frag|vert|wgsl|svg|env|gitignore|prettierrc|eslintrc|editorconfig|log)$/i;
 const fileUrl = (p) => `/__pixi-editor/api/file?path=${encodeURIComponent(p)}`;
@@ -3653,4 +3767,201 @@ async function renderSpineView(view, e, files) {
     window.removeEventListener("keydown", onKeySpine, true);
     try { container.destroy({ children: true }); rt.destroy(true); } catch { /* already gone */ }
   };
+}
+
+// ---------------------------------------------------------------- new project
+const NEW_PARENT_KEY = "pixi-editor:new-parent";
+const newModal = $("#new-modal");
+const pathSep = () => (state.platform === "win32" ? "\\" : "/");
+const slugify = (n) => String(n || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-.]+|-+$/g, "").slice(0, 80);
+function defaultParent() {
+  try { const saved = localStorage.getItem(NEW_PARENT_KEY); if (saved) return saved; } catch { /* private mode */ }
+  const recent = state.recent[0] && state.recent[0].path;
+  if (recent) return recent.replace(/[/\\][^/\\]+[/\\]?$/, "");
+  return state.home || "";
+}
+function updateNewPath() {
+  const parent = $("#new-parent").value.trim().replace(/[/\\]+$/, "");
+  const slug = slugify($("#new-name").value);
+  $("#new-path").textContent = slug ? `Will be created at ${parent}${pathSep()}${slug}` : "Give the project a name.";
+  $("#new-create").disabled = !slug || !parent;
+}
+function openNewProject() {
+  if (state.project && pendingCount() && !window.confirm("You have unsaved changes in this project. Continue anyway?")) return;
+  $("#new-form").classList.remove("hidden");
+  $("#new-progress").classList.add("hidden");
+  $("#new-error").textContent = "";
+  $("#new-parent").value = defaultParent();
+  updateNewPath();
+  newModal.classList.remove("hidden");
+  $("#new-name").focus();
+  $("#new-name").select();
+}
+const closeNewModal = () => newModal.classList.add("hidden");
+$("#btn-welcome-new").onclick = openNewProject;
+$("#new-cancel").onclick = closeNewModal;
+$("#new-name").addEventListener("input", updateNewPath);
+$("#new-parent").addEventListener("input", updateNewPath);
+newModal.addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Escape" && !$("#new-form").classList.contains("hidden")) closeNewModal();
+});
+$("#new-browse").onclick = async () => {
+  $("#new-error").textContent = "Waiting for the folder picker…";
+  const res = await (await fetch("/__pixi-editor/api/pick", { method: "POST" })).json();
+  $("#new-error").textContent = res.error || "";
+  if (res.path) { $("#new-parent").value = res.path; updateNewPath(); }
+};
+$("#new-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const body = {
+    name: $("#new-name").value.trim(),
+    parent: $("#new-parent").value.trim(),
+    lint: $("#new-lint").checked,
+    install: $("#new-install").checked,
+  };
+  $("#new-error").textContent = "";
+  const res = await (await fetch("/__pixi-editor/api/new", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+  if (!res.ok) { $("#new-error").textContent = res.error; return; }
+  try { localStorage.setItem(NEW_PARENT_KEY, body.parent); } catch { /* private mode */ }
+  runJob(res, body.install ? "Installing dependencies (npm install)…" : "Opening the project…");
+};
+
+/** Shows the progress of an install-and-open job (new project or missing dependencies) until it opens. */
+async function runJob(job, firstStep) {
+  $("#new-form").classList.add("hidden");
+  newModal.classList.remove("hidden");
+  const progress = $("#new-progress");
+  progress.classList.remove("hidden");
+  progress.querySelector(".spinner").style.display = "";
+  progress.querySelectorAll(".job-actions").forEach((x) => x.remove());
+  const step = $("#new-step"), log = $("#new-log");
+  step.textContent = firstStep;
+  const head = `Folder: ${job.dir}\n`;
+  log.textContent = head;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 600));
+    let st;
+    try { st = await (await fetch(`/__pixi-editor/api/new-status?id=${job.id}`)).json(); } catch { continue; }
+    if (st.log) { log.textContent = head + st.log; log.scrollTop = log.scrollHeight; }
+    if (st.state === "opening") step.textContent = "Opening the project…";
+    if (st.state === "done") {
+      closeNewModal();
+      try { state.recent = (await (await fetch("/__pixi-editor/api/state")).json()).recent || state.recent; } catch { /* keep */ }
+      if (state.project) resetProjectView();
+      $("#welcome-error").textContent = "";
+      showProject(st.project);
+      setStatus(`Opened ${st.project.name} — ${st.project.path}`, "ok");
+      return;
+    }
+    if (st.state === "error") {
+      step.textContent = "Something went wrong";
+      log.textContent = `${head}${st.log || ""}\n${st.error}`;
+      log.scrollTop = log.scrollHeight;
+      progress.querySelector(".spinner").style.display = "none";
+      const actions = document.createElement("div");
+      actions.className = "review-foot job-actions";
+      actions.innerHTML = `<span class="note">The files are in the folder above. You can also run <code>npm install</code> there yourself and open it.</span><span class="spacer"></span><button class="ghost" data-a="close">Close</button><button class="primary" data-a="retry">Retry</button>`;
+      actions.querySelector('[data-a="close"]').onclick = () => { closeNewModal(); actions.remove(); };
+      actions.querySelector('[data-a="retry"]').onclick = async () => {
+        actions.remove();
+        const r = await (await fetch("/__pixi-editor/api/job-retry", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: job.id }) })).json();
+        if (r.ok) runJob(r, "Installing dependencies (npm install)…");
+        else { step.textContent = r.error; progress.appendChild(actions); }
+      };
+      progress.appendChild(actions);
+      return;
+    }
+  }
+}
+
+/** A project without node_modules: explain and offer `npm install`. */
+function offerInstall(path, message) {
+  const box = $("#welcome-error");
+  box.textContent = "";
+  const p = document.createElement("span");
+  p.textContent = `${message} `;
+  const btn = document.createElement("button");
+  btn.className = "primary";
+  btn.textContent = "Install dependencies (npm install)";
+  btn.onclick = () => installAndOpen(path);
+  box.append(p, btn);
+  if (state.project) {
+    // Another project is open: ask right away.
+    if (window.confirm(`${message}\n\nInstall its dependencies now (npm install) and open it?`)) installAndOpen(path);
+  }
+}
+async function installAndOpen(path) {
+  if (pendingCount() && !window.confirm("You have unsaved changes. Open another project anyway?")) return;
+  const res = await (await fetch("/__pixi-editor/api/install", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) })).json();
+  if (!res.ok) { setStatus(res.error, "err"); $("#welcome-error").textContent = res.error; return; }
+  runJob(res, "Installing dependencies (npm install)…");
+}
+
+// ---------------------------------------------------------------- close project
+/** Clears everything that belongs to the open project in the editor. */
+function resetProjectView() {
+  clearInterval(pollTimer);
+  urlBar.classList.add("hidden");
+  iframe.removeAttribute("src");
+  state.win = state.pe = state.app = state.PIXI = null;
+  state.compMod = null;
+  state.spineMod = undefined;
+  state.selected = state.hover = null;
+  state.fileView = null;
+  state.pending.clear(); state.undo = []; state.redo = [];
+  state.compOriginal.clear();
+  state.info.clear();
+  state.treeSig = "";
+  treeEl.innerHTML = "";
+  filesState.cache.clear();
+  filesState.expanded = new Set([""]);
+  filesState.selected = filesState.linked = null;
+  filesEl.innerHTML = "";
+  $("#connecting").className = "connecting hidden";
+  updateSaveButton();
+  renderInspector();
+  render();
+}
+async function closeProject() {
+  if (!state.project) return;
+  const n = pendingCount();
+  if (n && !window.confirm(`You have ${n} unsaved change${n > 1 ? "s" : ""}. Close the project anyway?`)) return;
+  const name = state.project.name;
+  resetProjectView();
+  state.project = null;
+  try { await fetch("/__pixi-editor/api/close", { method: "POST" }); } catch { /* editor stopped */ }
+  projectInput.value = "";
+  projectInput.title = "";
+  document.title = "Pixi Editor";
+  $("#btn-close-project").classList.add("hidden");
+  try { state.recent = (await (await fetch("/__pixi-editor/api/state")).json()).recent || state.recent; } catch { /* keep */ }
+  renderWelcomeRecent();
+  $("#welcome-error").textContent = "";
+  welcome.classList.remove("hidden");
+  setStatus(`Closed ${name}`);
+}
+$("#btn-close-project").onclick = closeProject;
+
+
+// ---------------------------------------------------------------- migrate the old components file
+async function migrateComponents() {
+  if (pendingCount()) { setStatus("Save or undo your changes first: migrating reloads the game.", "err"); return; }
+  const call = async (dryRun) => (await (await fetch("/__pixi-editor/api/migrate-components", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dryRun }),
+  })).json());
+  const plan = await call(true);
+  if (!plan.ok) { setStatus(plan.error.split("\n").join(" · "), "err"); return; }
+  const notes = [
+    "Components are now one file each, grouped by category: import { Anchor } from \".../pixi-components/layout\".",
+    ...(plan.newFiles.length ? [`New files: ${plan.newFiles.join(", ")}`] : []),
+    plan.legacyChanged
+      ? `${plan.legacy} has changes of yours: it is kept as ${plan.keptAs} so you can copy them over.`
+      : `${plan.legacy} is removed (it had no changes of yours).`,
+  ];
+  if (!(await confirmCode({ title: "Migrate components", sub: "Imports are rewritten in these files", notes, diffs: plan.diffs, confirmLabel: "Migrate" }))) return;
+  const res = await call(false);
+  if (!res.ok) { setStatus(res.error, "err"); return; }
+  state.afterReload = `Components migrated to ${res.newFiles.length ? res.newFiles[0].replace(/\/[^/]+$/, "") : "src/pixi-components"} — game reloaded`;
+  iframe.contentWindow.location.reload();
 }

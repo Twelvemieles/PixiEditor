@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Pixi Editor</title>
+  <link rel="icon" type="image/svg+xml" href="/__pixi-editor/favicon.svg" />
   <link rel="stylesheet" href="/__pixi-editor/editor.css" />
 </head>
 <body>
@@ -26,6 +27,7 @@
       <button id="mode-play" class="mode" title="Interact with the game normally">Play</button>
     </div>
     <div class="actions">
+      <button id="btn-close-project" class="ghost hidden" title="Close this project and go back to the start screen">⌂ Close project</button>
       <button id="btn-reload" class="ghost" title="Reload the game">↻ Reload</button>
       <button id="btn-undo" class="ghost" title="Undo (Ctrl/Cmd+Z)">↶ Undo</button>
       <button id="btn-save" class="primary" disabled title="Save to code (Ctrl/Cmd+S)">Save <span id="save-count"></span></button>
@@ -71,6 +73,15 @@
     </aside>
     <div class="splitter v" data-split="left" title="Drag to resize · double-click to reset"></div>
 
+    <div class="scene-col">
+    <div class="urlbar hidden" id="urlbar">
+      <span class="url-origin" id="url-origin" title="The game runs on the editor's server">localhost</span>
+      <input id="url-input" type="text" spellcheck="false" autocomplete="off" list="url-recent"
+        title="The game's URL: add query parameters (?lang=es&amp;debug=1) and press Enter to reload the game with them. Esc reverts."
+        placeholder="/?param=value" />
+      <datalist id="url-recent"></datalist>
+      <button id="url-clear" class="hidden" title="Remove the parameters and reload the game">✕</button>
+    </div>
     <section class="viewport" id="viewport">
       <iframe id="game" title="Game"></iframe>
       <div id="overlay" tabindex="0"><canvas id="gizmo"></canvas></div>
@@ -110,12 +121,16 @@
           <div class="welcome-logo"></div>
           <h1>Open a PixiJS project</h1>
           <p>Pick the root folder of a Vite + PixiJS project. Nothing in the project needs to change.</p>
-          <button id="btn-welcome-browse" class="primary big">Browse for a folder…</button>
+          <div class="welcome-actions">
+            <button id="btn-welcome-browse" class="primary big">Browse for a folder…</button>
+            <button id="btn-welcome-new" class="ghost big">＋ New project…</button>
+          </div>
           <div class="welcome-recent" id="welcome-recent"></div>
           <p class="welcome-error" id="welcome-error"></p>
         </div>
       </div>
     </section>
+    </div>
 
     <div class="splitter v" data-split="right" title="Drag to resize · double-click to reset"></div>
     <section class="panel" id="inspector-panel">
@@ -125,6 +140,33 @@
       </div>
     </section>
   </main>
+
+  <div class="modal hidden" id="new-modal">
+    <div class="modal-card new-card">
+      <div class="modal-head"><b>New PixiJS project</b></div>
+      <form id="new-form" class="new-form" autocomplete="off">
+        <label>Name<input id="new-name" type="text" value="my-pixi-game" spellcheck="false" required /></label>
+        <label>Location
+          <span class="new-loc"><input id="new-parent" type="text" spellcheck="false" required /><button type="button" class="ghost" id="new-browse">Browse…</button></span>
+        </label>
+        <p class="note new-path" id="new-path"></p>
+        <label class="check"><input id="new-lint" type="checkbox" checked /> ESLint + Prettier (lint and format scripts)</label>
+        <label class="check"><input id="new-install" type="checkbox" checked /> Install dependencies now (npm install)</label>
+        <p class="note">Creates a Vite + PixiJS v8 + TypeScript game with a first scene, then opens it here.</p>
+        <p class="welcome-error" id="new-error"></p>
+        <div class="review-foot">
+          <span class="spacer"></span>
+          <button type="button" class="ghost" id="new-cancel">Cancel</button>
+          <button type="submit" class="primary" id="new-create">Create project</button>
+        </div>
+      </form>
+      <div class="new-progress hidden" id="new-progress">
+        <div class="spinner"></div>
+        <b id="new-step">Creating files…</b>
+        <pre id="new-log"></pre>
+      </div>
+    </div>
+  </div>
 
   <div class="modal hidden" id="review-modal">
     <div class="modal-card review-card">

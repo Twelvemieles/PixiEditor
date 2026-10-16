@@ -360,6 +360,153 @@ const scenarios = [
       check(!(await muted()), "and can be unmuted");
     },
   },
+  {
+    name: "basic: game URL bar with parameters",
+    fixture: "basic",
+    async run(ed) {
+      const page = ed.page;
+      const gameSearch = () => page.evaluate(() => document.querySelector("#game").contentWindow.location.search);
+      const connected = () => page.waitForFunction(() => /^Connected to/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      check(await page.isVisible("#urlbar"), "URL bar is shown with a project open");
+      check((await page.inputValue("#url-input")) === "/", "it shows the game's URL", await page.inputValue("#url-input"));
+      await page.fill("#url-input", "lang=es&debug=1");
+      await page.press("#url-input", "Enter");
+      await connected();
+      check((await gameSearch()) === "?lang=es&debug=1", "Enter reloads the game with the parameters", await gameSearch());
+      check((await page.inputValue("#url-input")) === "/?lang=es&debug=1", "the bar shows the full path");
+      check(await ed.select("title"), "the editor still works after the reload");
+      await page.reload();
+      await connected();
+      check((await gameSearch()) === "?lang=es&debug=1", "the parameters are remembered for the project");
+      check((await page.$$eval("#url-recent option", (o) => o.map((x) => x.value))).includes("/?lang=es&debug=1"), "and kept in the history");
+      await page.evaluate(() => document.querySelector("#game").contentWindow.history.replaceState(null, "", "/?lang=en"));
+      await page.waitForFunction(() => document.querySelector("#url-input").value === "/?lang=en", null, { timeout: 3000 }).catch(() => {});
+      check((await page.inputValue("#url-input")) === "/?lang=en", "URL changes made by the game show up");
+      await page.click("#url-clear");
+      await connected();
+      check((await gameSearch()) === "", "✕ removes the parameters");
+    },
+  },
+  {
+    name: "start screen: close project, create a new one",
+    fixture: "basic",
+    async run(ed, project) {
+      const page = ed.page;
+      await page.click("#btn-close-project");
+      await page.waitForSelector("#welcome:not(.hidden)", { timeout: 10000 });
+      const st = await page.evaluate(async () => (await (await fetch("/__pixi-editor/api/state")).json()).project);
+      check(st === null, "closing the project stops it on the server");
+      check(await page.isHidden("#btn-close-project"), "the start screen is back, without the close button");
+      check((await page.$$("#tree .node")).length === 0, "the hierarchy is empty");
+
+      // New project, created next to the fixture (so it uses the editor's node_modules, no npm install).
+      const parent = path.dirname(project);
+      fs.rmSync(path.join(parent, "e2e-game"), { recursive: true, force: true });
+      await page.click("#btn-welcome-new");
+      await page.fill("#new-name", "E2E Game");
+      await page.fill("#new-parent", parent);
+      check(/e2e-game$/.test(await page.textContent("#new-path")), "the final folder name is shown");
+      await page.uncheck("#new-install");
+      await page.click("#new-create");
+      await page.waitForFunction(() => /^Connected to e2e-game/.test(document.querySelector("#status").textContent) || /Created/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      await page.waitForFunction(() => /^Connected to/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      const dir = path.join(parent, "e2e-game");
+      check(["package.json", "index.html", "src/main.ts", "src/scene.ts", "tsconfig.json", ".gitignore", ".prettierrc", "eslint.config.js", "public/assets/star.png"].every((f) => fs.existsSync(path.join(dir, f))), "all project files are written");
+      const pkg = JSON.parse(read(dir, "package.json"));
+      check(pkg.name === "e2e-game" && pkg.dependencies["pixi.js"] && pkg.devDependencies.vite && pkg.scripts.lint, "package.json has pixi.js, vite and the lint scripts");
+      check(await page.isVisible("#btn-close-project"), "the new project is open");
+
+      // It works like any project: edit the generated scene.
+      await page.keyboard.press("Control+e");
+      await page.waitForTimeout(500);
+      check(await ed.select("title"), "the generated scene is linked to its code");
+      await ed.key("Shift+ArrowDown", 2);
+      await ed.save();
+      check(has(read(dir, "src/scene.ts"), "title.position.set(0, 70);"), "editing it writes src/scene.ts", changed("", read(dir, "src/scene.ts")).slice(0, 300));
+      const prettier = await import("prettier");
+      const file = path.join(dir, "src/scene.ts");
+      check(await prettier.check(read(dir, "src/scene.ts"), { ...((await prettier.resolveConfig(file)) || {}), filepath: file }), "the generated code stays Prettier-clean");
+    },
+  },
+  {
+    name: "components: category folders and imports",
+    fixture: "basic",
+    async run(ed, project) {
+      const page = ed.page;
+      const exists = (f) => fs.existsSync(path.join(project, f));
+      await ed.select("title");
+      await page.selectOption(".comp-add", "Anchor");
+      await page.waitForTimeout(300);
+      const groups = await page.$$eval(".comp-add optgroup", (g) => g.map((x) => x.label));
+      check(["Layout", "UI", "Animation"].every((l) => groups.includes(l) || l === "Layout"), "the menu groups components by category", groups.join(", "));
+      await ed.select("hint");
+      await page.selectOption(".comp-add", "Button");
+      await page.waitForTimeout(300);
+      const review = await ed.save();
+      check(review.messages.some((m) => /pixi-components\/core\.ts/.test(m)), "the review lists the component files it will add", review.messages.join(" | "));
+      const hud = read(project, "src/hud.ts");
+      check(has(hud, 'import { addComponent } from "./pixi-components/core";'), "addComponent comes from core", hud.split("\n").slice(0, 6).join("\n"));
+      check(has(hud, 'import { Anchor } from "./pixi-components/layout";') && has(hud, 'import { Button } from "./pixi-components/ui";'), "one import per category");
+      check(has(hud, "addComponent(title, Anchor, {") && has(hud, "addComponent(hint, Button, {"), "addComponent lines written");
+      check(has(read(project, "src/main.ts"), 'import { useApp } from "./pixi-components/core";'), "useApp (needed by Anchor) imported from core");
+      check(["core.ts", "layout/index.ts", "layout/Anchor.ts", "ui/index.ts", "ui/Button.ts"].every((f) => exists(`src/pixi-components/${f}`)), "core, layout and ui are copied");
+      check(!exists("src/pixi-components/animation") && !exists("src/pixi-components.ts"), "unused categories are not copied, and no single file");
+
+      // Remove Button: its import goes, the files stay.
+      await ed.select("hint");
+      await page.click('.comp[data-type="Button"] .comp-remove');
+      await ed.save();
+      const hud2 = read(project, "src/hud.ts");
+      check(!has(hud2, "pixi-components/ui") && !has(hud2, "addComponent(hint"), "removing the last UI component removes its import", changed(hud, hud2));
+
+      // After a reload the components are read back from the project's own files.
+      await page.reload();
+      await page.waitForFunction(() => /^Connected to/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      await page.waitForTimeout(800);
+      await page.keyboard.press("Control+e");
+      await ed.select("title");
+      await page.waitForTimeout(500);
+      check(await page.$('.comp[data-type="Anchor"]'), "Anchor is shown on title after reloading");
+      const bh = await page.evaluate(async () => (await (await fetch("/__pixi-editor/api/behavior", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Spinner", objectName: "title" }) })).json()));
+      check(bh.ok && has(read(project, "src/behaviors/Spinner.ts"), 'from "../pixi-components/core";'), "new behaviors import from core", JSON.stringify(bh));
+    },
+  },
+  {
+    name: "components: migrate the old single file",
+    fixture: "basic",
+    async run(ed, project) {
+      const page = ed.page;
+      // An old project: src/pixi-components.ts and an import of it.
+      fs.copyFileSync(path.join(REPO, "templates/legacy/pixi-components.ts"), path.join(project, "src/pixi-components.ts"));
+      const hudFile = path.join(project, "src/hud.ts");
+      let hud = read(project, "src/hud.ts");
+      hud = hud.replace('import { Container, Graphics, Text } from "pixi.js";', 'import { Container, Graphics, Text } from "pixi.js";\nimport { addComponent, Button } from "./pixi-components";');
+      hud = hud.replace("  hud.addChild(title);", "  hud.addChild(title);\n  addComponent(title, Button, { hoverScale: 1.1 });");
+      fs.writeFileSync(hudFile, hud);
+      await page.reload();
+      await page.waitForFunction(() => /^Connected to/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      await page.waitForTimeout(800);
+      await page.keyboard.press("Control+e");
+      await ed.select("title");
+      await page.waitForSelector(".legacy-note button", { timeout: 10000 }).catch(() => {});
+      check(await page.$(".legacy-note button"), "old projects get a Migrate button");
+      check(await page.$('.comp[data-type="Button"]'), "the old file's components still show");
+      await page.click(".legacy-note button");
+      await page.waitForSelector("#review-modal:not(.hidden)");
+      const lines = await page.$$eval("#review-diff .diff-line.add .code", (l) => l.map((x) => x.textContent.trim()));
+      check(lines.includes('import { addComponent } from "./pixi-components/core";') && lines.includes('import { Button } from "./pixi-components/ui";'), "the preview splits the import", lines.join(" | "));
+      await page.keyboard.press("Enter");
+      await page.waitForFunction(() => /migrated/.test(document.querySelector("#status").textContent), null, { timeout: 60000 });
+      const after = read(project, "src/hud.ts");
+      check(!fs.existsSync(path.join(project, "src/pixi-components.ts")), "the old file is removed (it had no changes)");
+      check(fs.existsSync(path.join(project, "src/pixi-components/ui/Button.ts")) && !fs.existsSync(path.join(project, "src/pixi-components/layout")), "only the categories in use are added");
+      check(has(after, "addComponent(title, Button, { hoverScale: 1.1 });"), "the code itself is untouched");
+      await page.keyboard.press("Control+e");
+      await ed.select("title");
+      await page.waitForTimeout(500);
+      check(await page.$('.comp[data-type="Button"]') && !(await page.$(".legacy-note")), "after migrating, Button still works and the note is gone");
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- main

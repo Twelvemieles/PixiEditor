@@ -1,0 +1,126 @@
+#!/bin/bash
+# App-bundle entry point for Pixi Editor. Double-click PixiEditor.app in Finder: it starts the editor
+# in the background (no Terminal window) and the browser opens on it. If the editor is already
+# running it just opens the browser again. Stop it with the "Quit" button in the editor's top bar.
+# pixi-editor.command runs this same script with --console: everything in a visible Terminal window.
+#
+# Contents/MacOS/launcher -> Contents -> PixiEditor.app -> repo root
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$DIR" || exit 1
+
+PORT="${PIXI_EDITOR_PORT:-5180}"
+URL="http://localhost:$PORT/__pixi-editor/"
+MIN_NODE_MAJOR=20
+CONSOLE=0
+if [ "$1" = "--console" ]; then CONSOLE=1; shift; fi
+
+DATA="$HOME/.pixi-editor"
+LOG="$DATA/editor.log"
+mkdir -p "$DATA"
+# Rotate once per launch: past 5MB the log becomes editor.log.old.
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt $((5 * 1024 * 1024)) ]; then
+  mv -f "$LOG" "$LOG.old"
+fi
+
+info() { echo "$1"; }
+# No Terminal window in app mode, so a native alert is the only way to tell the person anything.
+fail() {
+  echo "ERROR: $1"
+  if [ "$CONSOLE" = 1 ]; then
+    read -n 1 -s -r -p "Press any key to close this window..."
+  else
+    local msg="${1//\"/\\\"}"
+    osascript -e "display dialog \"$msg\" buttons {\"OK\"} default button \"OK\" with title \"Pixi Editor\" with icon caution" >/dev/null 2>&1
+  fi
+  exit 1
+}
+is_running() { curl -s -m 1 "http://127.0.0.1:$PORT/__pixi-editor/api/ping" 2>/dev/null | grep -q '"pixi-editor"'; }
+
+# Apps started from Finder don't get the shell's PATH, so look for node where installers put it.
+find_node() {
+  local n
+  # Explicit choice: ~/.pixi-editor/node-path holds the full path of the node binary to use.
+  n="$(head -n 1 "$DATA/node-path" 2>/dev/null)"
+  [ -n "$n" ] && [ -x "$n" ] && { echo "$n"; return; }
+  n="$(command -v node 2>/dev/null)" && [ -x "$n" ] && { echo "$n"; return; }
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  if [ -s "$NVM_DIR/nvm.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1
+    n="$(nvm which default 2>/dev/null | tail -n 1)"
+    [ -x "$n" ] && { echo "$n"; return; }
+    n="$(ls -d "$NVM_DIR"/versions/node/v*/bin/node 2>/dev/null | sed 's#.*/v\([0-9.]*\)/bin/node$#\1 &#' \
+      | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -d' ' -f2)"
+    [ -x "$n" ] && { echo "$n"; return; }
+  fi
+  for n in "$HOME/.volta/bin/node" "$HOME/.asdf/shims/node" "$HOME/.local/share/fnm/aliases/default/bin/node" \
+           "$HOME/Library/Application Support/fnm/aliases/default/bin/node" /opt/homebrew/bin/node /usr/local/bin/node; do
+    [ -x "$n" ] && { echo "$n"; return; }
+  done
+  # Last resort: ask the person's login shell (slow, and runs their shell startup files).
+  n="$("${SHELL:-/bin/zsh}" -ilc 'command -v node' 2>/dev/null | tail -n 1)"
+  [ -x "$n" ] && echo "$n"
+}
+
+main() {
+  echo "---- launched $(date) ----"
+
+  if is_running; then
+    info "Pixi Editor is already running — opening $URL"
+    open "$URL"
+    exit 0
+  fi
+
+  NODE="$(find_node)"
+  [ -n "$NODE" ] || fail "Pixi Editor needs Node.js, which wasn't found on this Mac.
+
+Install Node.js $MIN_NODE_MAJOR or newer (nodejs.org, nvm or Homebrew), then open Pixi Editor again. If it is installed somewhere unusual, write the full path of its node binary into ~/.pixi-editor/node-path."
+  # npm (used for new projects) and the project's tools must find this same node.
+  export PATH="$(dirname "$NODE"):$PATH:/opt/homebrew/bin:/usr/local/bin"
+  # Prefer the CPU's native architecture (LaunchServices may start script apps under Rosetta).
+  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then ARCH=(arch -arm64 -x86_64); else ARCH=(); fi
+  run() { "${ARCH[@]}" "$@"; }
+
+  VERSION="$(run "$NODE" -p 'process.versions.node' 2>/dev/null)"
+  info "node: $NODE (v$VERSION)"
+  [ "${VERSION%%.*}" -ge "$MIN_NODE_MAJOR" ] 2>/dev/null || fail "Pixi Editor needs Node.js $MIN_NODE_MAJOR or newer, but found ${VERSION:-an unknown version} at $NODE.
+
+Install a newer Node.js, then open Pixi Editor again."
+
+  # Install the editor's own dependencies on first run, and again whenever package-lock.json changes.
+  STAMP_FILE="node_modules/.pixi-editor-stamp"
+  LOCK_SUM="$(cksum < package-lock.json 2>/dev/null)"
+  if [ ! -d node_modules ] || { [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE")" != "$LOCK_SUM" ]; }; then
+    info "Installing Pixi Editor's dependencies…"
+    run "$NODE" "$(dirname "$NODE")/npm" install --no-fund --no-audit 2>&1 || run npm install --no-fund --no-audit 2>&1 \
+      || fail "Couldn't install Pixi Editor's dependencies (npm install failed). Check your internet connection and try again. Details are in $LOG."
+  fi
+  [ -d node_modules ] && echo "$LOCK_SUM" > "$STAMP_FILE"
+
+  if [ "$CONSOLE" = 1 ]; then
+    exec "${ARCH[@]}" "$NODE" bin/pixi-editor.js --port "$PORT" "$@"
+  fi
+
+  # Detach the editor so this app finishes launching right away (no Dock icon left bouncing).
+  LOG_START=$(($(wc -l < "$LOG") + 1))
+  nohup "${ARCH[@]}" "$NODE" bin/pixi-editor.js --port "$PORT" "$@" >>"$LOG" 2>&1 < /dev/null &
+  PID=$!
+  disown
+  for _ in $(seq 1 60); do
+    sleep 0.25
+    is_running && exit 0
+    kill -0 "$PID" 2>/dev/null || break
+  done
+  kill -0 "$PID" 2>/dev/null && exit 0 # still starting up; it opens the browser itself when ready
+  fail "Pixi Editor stopped while starting:
+
+$(tail -n "+$LOG_START" "$LOG" | tail -n 8)
+
+The full log is in $LOG."
+}
+
+if [ "$CONSOLE" = 1 ]; then
+  main "$@"
+else
+  main "$@" >>"$LOG" 2>&1
+fi

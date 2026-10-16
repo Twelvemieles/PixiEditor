@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node bin/pixi-editor.js",
     "test": "node test/run.js",
-    "e2e": "node test/e2e/run.js"
+    "e2e": "node test/e2e/run.js",
+    "build:icon": "node scripts/build-app-icon.js"
   },
   "keywords": [
     "pixi",

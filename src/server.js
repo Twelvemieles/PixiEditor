@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import net from "node:net";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import pixiEditor from "./plugin.js";
@@ -14,6 +14,7 @@ import pixiEditor from "./plugin.js";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDITOR_DIR = path.resolve(HERE, "../editor");
 const BASE = "/__pixi-editor/";
+const NEW_PROJECT_TEMPLATE = path.resolve(HERE, "../templates/new-project");
 const MIME = {
   ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png",
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".avif": "image/avif",
@@ -154,6 +155,101 @@ function inspectProject(dir) {
   return { root, name: path.basename(root), pixi: deps["pixi.js"] || null, warnings };
 }
 
+// ------------------------------------------------------------ new projects
+// Versions written into new projects' package.json (bump them here).
+const NEW_PROJECT_DEPS = { "pixi.js": "^8.22.0" };
+const NEW_PROJECT_DEV_DEPS = { typescript: "~5.9.3", vite: "^8.3.4" };
+const NEW_PROJECT_LINT_DEPS = {
+  "@eslint/js": "^10.0.1",
+  eslint: "^10.12.0",
+  "eslint-config-prettier": "^10.1.8",
+  prettier: "^3.9.10",
+  "typescript-eslint": "^8.71.2",
+};
+
+/** Folder name for a project name: "My Game" -> "my-game". */
+export function projectSlug(name) {
+  return String(name || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-.]+|-+$/g, "").slice(0, 80);
+}
+
+/**
+ * Writes a new Vite + PixiJS + TypeScript project into `<parent>/<slug(name)>`.
+ * @returns {string} the project folder
+ */
+export function writeNewProject({ name, parent, lint = true }) {
+  const slug = projectSlug(name);
+  if (!slug) throw new Error("Give the project a name (letters, numbers, - or _).");
+  const base = path.resolve(expandHome(String(parent || "").trim() || os.homedir()));
+  const dir = path.join(base, slug);
+  if (fs.existsSync(dir) && fs.readdirSync(dir).length) throw new Error(`${dir} already exists and is not empty.`);
+  fs.mkdirSync(dir, { recursive: true });
+  const title = String(name).trim() || slug;
+  const skip = lint ? new Set() : new Set(["eslint.config.js", "prettierrc"]);
+  const copy = (from, to) => {
+    for (const ent of fs.readdirSync(from, { withFileTypes: true })) {
+      if (skip.has(ent.name)) continue;
+      const src = path.join(from, ent.name);
+      // Dotfiles are stored without the dot (npm and git treat dotfiles in packages specially).
+      const destName = ["gitignore", "prettierrc"].includes(ent.name) ? `.${ent.name}` : ent.name;
+      const dest = path.join(to, destName);
+      if (ent.isDirectory()) { fs.mkdirSync(dest, { recursive: true }); copy(src, dest); continue; }
+      if (/\.(png|jpe?g|webp|avif|gif|mp3|ogg|wav|m4a)$/i.test(ent.name)) { fs.copyFileSync(src, dest); continue; }
+      fs.writeFileSync(dest, fs.readFileSync(src, "utf8").replaceAll("__TITLE__", title));
+    }
+  };
+  copy(NEW_PROJECT_TEMPLATE, dir);
+  const pkg = {
+    name: slug,
+    private: true,
+    version: "0.0.0",
+    type: "module",
+    scripts: {
+      dev: "vite",
+      build: lint ? "tsc && eslint . && vite build" : "tsc && vite build",
+      preview: "vite preview",
+      ...(lint ? { lint: "eslint .", format: "prettier --write ." } : {}),
+    },
+    dependencies: NEW_PROJECT_DEPS,
+    devDependencies: Object.fromEntries(Object.entries({ ...NEW_PROJECT_DEV_DEPS, ...(lint ? NEW_PROJECT_LINT_DEPS : {}) }).sort()),
+  };
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
+  return dir;
+}
+
+/** Runs `npm install` once in `dir`, calling `onLog` with output. Resolves with the output's error kind. */
+function npmInstallOnce(dir, onLog) {
+  return new Promise((resolve, reject) => {
+    const win = process.platform === "win32";
+    // --prefer-offline: packages already in npm's cache (from other projects) are not downloaded again.
+    const child = spawn(win ? "npm.cmd" : "npm", ["install", "--prefer-offline", "--no-fund", "--no-audit"], { cwd: dir, shell: win, env: process.env });
+    let out = "";
+    const take = (d) => { out += d; onLog(String(d)); };
+    child.stdout.on("data", take);
+    child.stderr.on("data", take);
+    child.on("error", (err) => reject(Object.assign(new Error(err.code === "ENOENT" ? "npm was not found. Install Node.js (it includes npm) and try again." : String(err.message || err)), { fatal: true })));
+    child.on("exit", (code) => {
+      if (code === 0) return resolve();
+      const network = /ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|socket hang up|network/i.test(out);
+      reject(Object.assign(new Error(network
+        ? "npm could not download the packages (network error). Check your internet connection or proxy, then press Retry."
+        : `npm install failed (exit code ${code}).`), { network }));
+    });
+  });
+}
+
+/** `npm install` with automatic retries for network errors (connections reset, timeouts…). */
+async function npmInstall(dir, onLog, attempts = 3) {
+  for (let i = 1; ; i++) {
+    try {
+      return await npmInstallOnce(dir, onLog);
+    } catch (err) {
+      if (err.fatal || !err.network || i >= attempts) throw err;
+      onLog(`\nNetwork error — retrying (${i + 1}/${attempts})…\n`);
+      await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+}
+
 // ------------------------------------------------------------ ports
 /** Finds a free TCP port (used for Vite's HMR websocket). */
 function freePort() {
@@ -191,6 +287,29 @@ async function takeOverPort(port) {
 export async function startEditor({ port = 5180, project = null, open = true } = {}) {
   let current = null; // { name, path, vite, pixi, warnings }
   let switching = Promise.resolve();
+  const jobs = new Map(); // install-and-open jobs (new projects, missing node_modules)
+  let jobCounter = 0;
+  /** npm install (optional) then open `dir`, in the background; the page polls the job. */
+  function startJob(dir, install) {
+    const id = String(++jobCounter);
+    const job = { id, state: install ? "installing" : "opening", log: "", dir, error: null, project: null };
+    jobs.set(id, job);
+    (async () => {
+      try {
+        if (install) await npmInstall(dir, (t) => { job.log = (job.log + t).slice(-6000); });
+        job.state = "opening";
+        const task = switching.then(() => openProject(dir));
+        switching = task.catch(() => {});
+        await task;
+        job.project = publicProject();
+        job.state = "done";
+      } catch (err) {
+        job.state = "error";
+        job.error = String(err.message || err);
+      }
+    })();
+    return job;
+  }
 
   async function openProject(dir) {
     const info = inspectProject(dir);
@@ -266,6 +385,44 @@ export async function startEditor({ port = 5180, project = null, open = true } =
       } catch (err) {
         return json(res, 200, { ok: false, error: String(err.message || err) });
       }
+    }
+
+    // New project: write the files, npm install (a job the page polls), then open it.
+    if (p === `${BASE}api/new` && req.method === "POST") {
+      const body = await readBody(req);
+      let dir;
+      try { dir = writeNewProject(body); } catch (err) { return json(res, 200, { ok: false, error: String(err.message || err) }); }
+      const job = startJob(dir, body.install !== false);
+      return json(res, 200, { ok: true, id: job.id, dir });
+    }
+    // Install the dependencies of an existing folder (e.g. a project created while offline), then open it.
+    if (p === `${BASE}api/install` && req.method === "POST") {
+      const body = await readBody(req);
+      const dir = path.resolve(expandHome(String(body.path || "").trim()));
+      if (!fs.existsSync(path.join(dir, "package.json"))) return json(res, 200, { ok: false, error: "That folder has no package.json." });
+      const job = startJob(dir, true);
+      return json(res, 200, { ok: true, id: job.id, dir });
+    }
+    if (p === `${BASE}api/job-retry` && req.method === "POST") {
+      const body = await readBody(req);
+      const old = jobs.get(String(body.id || ""));
+      if (!old || old.state !== "error") return json(res, 200, { ok: false, error: "Nothing to retry." });
+      const job = startJob(old.dir, true);
+      return json(res, 200, { ok: true, id: job.id, dir: old.dir });
+    }
+    if (p === `${BASE}api/new-status`) {
+      const job = jobs.get(url.searchParams.get("id") || "");
+      return json(res, 200, job ? { state: job.state, log: job.log, dir: job.dir, error: job.error, project: job.project } : { state: "error", error: "Unknown job" });
+    }
+
+    // Close the project: stop its Vite and go back to the start screen.
+    if (p === `${BASE}api/close` && req.method === "POST") {
+      const task = switching.then(async () => {
+        if (current) { const vite = current.vite; current = null; await vite.close(); }
+      });
+      switching = task.catch(() => {});
+      try { await task; } catch { /* already closed */ }
+      return json(res, 200, { ok: true });
     }
 
     // Project explorer: list folders, search files, serve a file for previews.
