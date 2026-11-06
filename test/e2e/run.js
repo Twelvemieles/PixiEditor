@@ -232,6 +232,473 @@ const scenarios = [
     },
   },
   {
+    name: "basic: HTML elements of the page",
+    fixture: "basic",
+    async run(ed, project) {
+      const { page } = ed;
+      const before = read(project, "src/menu.ts");
+      const rows = () => page.$$eval("#tree .node.dom", (r) => r.map((x) => ({ name: x.querySelector(".name").textContent, type: x.querySelector(".type").textContent, linked: x.querySelector(".dot").classList.contains("editable") })));
+      await page.waitForTimeout(800);
+      const list = await rows();
+      check(list[0] && list[0].name === "Page (HTML)", "the hierarchy lists the page's HTML", JSON.stringify(list));
+      const menu = list.find((r) => r.name === "menu"), credits = list.find((r) => r.name === "#credits");
+      check(menu && menu.linked && /<div>/.test(menu.type), "the menu made with document.createElement is linked to its code", JSON.stringify(list));
+      check(credits && credits.linked, "an element from index.html is listed and linked to it");
+      check(!list.some((r) => /canvas/.test(r.type)), "the game's canvas is not listed as HTML");
+
+      // Clicking the button in the viewport selects it (HTML is drawn above the canvas).
+      const pt = await page.evaluate(() => {
+        const frame = document.querySelector("#game");
+        const btn = frame.contentDocument.querySelector("button");
+        const f = frame.getBoundingClientRect(), b = btn.getBoundingClientRect();
+        const z = f.width / frame.offsetWidth;
+        return { x: f.left + (b.left + b.width / 2) * z, y: f.top + (b.top + b.height / 2) * z };
+      });
+      await page.mouse.click(pt.x, pt.y);
+      await page.waitForTimeout(300);
+      const sel = await page.evaluate(() => {
+        const row = document.querySelector("#tree .node.selected");
+        return row && row._obj ? row._obj.tagName : null;
+      });
+      check(sel === "BUTTON", "clicking it in the viewport selects the button", sel);
+      await page.waitForSelector("#inspector .src b", { timeout: 10000 }).catch(() => {});
+      const insp = await page.textContent("#inspector");
+      check(/<button>/.test(insp) && insp.includes("src/menu.ts:10"), "the inspector shows the element and its code line", insp.slice(0, 300));
+
+      await page.keyboard.press("Control+f");
+      await page.keyboard.type("playBtn");
+      await page.waitForTimeout(300);
+      check((await page.textContent("#tree-count")) === "1", "search finds the HTML element");
+      await ed.key("Escape", 2);
+      await ed.key("Delete");
+      await page.waitForTimeout(300);
+      check(read(project, "src/menu.ts") === before, "Delete does nothing to HTML elements");
+
+      // Edit: the button's text (its line), a new style (a new line), the menu's padding (its line)
+      const field = (prop) => page.locator(`#inspector [data-dprop="${prop}"]`);
+      const game = (fn) => page.evaluate(fn);
+      await field("attr:textContent").fill("Start");
+      await field("attr:textContent").press("Enter");
+      check(await game(() => document.querySelector("#game").contentDocument.querySelector("button").textContent) === "Start", "the text changes live");
+      await page.fill("#inspector .dom-add input", "color");
+      await page.press("#inspector .dom-add input", "Enter");
+      await field("css:color").fill("#ff0000");
+      await field("css:color").press("Enter");
+      await page.evaluate(() => {
+        const pe = document.querySelector("#game").contentWindow.__PIXI_EDITOR__;
+        const menu = document.querySelector("#game").contentDocument.querySelector("button").parentElement;
+        window.pixiEditor.select(menu);
+        return !!pe;
+      });
+      await page.waitForTimeout(200);
+      await field("css:padding").focus();
+      await page.keyboard.press("ArrowUp");
+      await page.keyboard.press("ArrowUp");
+      await page.keyboard.press("Enter");
+      check(await game(() => document.querySelector("#game").contentDocument.querySelector("button").parentElement.style.padding) === "10px", "arrow keys change a size and keep its unit");
+      const review = await ed.save();
+      check(review.changes.length === 3, "review lists 3 changes", review.changes.join(", "));
+      const after = read(project, "src/menu.ts");
+      check(has(after, 'playBtn.textContent = "Start";'), "text written on its line", changed(before, after));
+      check(has(after, 'const playBtn = document.createElement("button");\n  playBtn.style.color = "#ff0000";'), "new style written after the creation", changed(before, after));
+      check(has(after, 'menu.style.padding = "10px";'), "padding written on its line", changed(before, after));
+      check(!(await page.$eval("#btn-save", (b) => !b.disabled)), "nothing left to save");
+
+      // index.html: the credits' text and left (in place), a new font size (added to its style)
+      const htmlBefore = read(project, "index.html");
+      await page.evaluate(() => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelector("#credits")));
+      await page.waitForTimeout(200);
+      check(/index\.html:\d+/.test(await page.textContent("#inspector")), "the inspector shows its line in index.html");
+      await field("attr:textContent").fill("Made with Pixi Editor");
+      await field("attr:textContent").press("Enter");
+      await field("css:left").fill("12px");
+      await field("css:left").press("Enter");
+      await page.fill("#inspector .dom-add input", "font-size");
+      await page.press("#inspector .dom-add input", "Enter");
+      await field("css:font-size").fill("14px");
+      await field("css:font-size").press("Enter");
+      const review2 = await ed.save();
+      check(review2.changes.length === 3, "review lists 3 changes", review2.changes.join(", "));
+      const html = read(project, "index.html");
+      check(has(html, '<div id="credits" style="position: fixed; left: 12px; bottom: 8px; color: #888; font-size: 14px">Made with Pixi Editor</div>'), "index.html rewritten in place", changed(htmlBefore, html));
+      check(!html.includes("data-pe"), "the editor's markers never reach the file");
+      await page.waitForFunction(() => /Saved|Connected/.test(document.querySelector("#status").textContent), null, { timeout: 20000 });
+      check(await page.evaluate(() => { const c = document.querySelector("#game").contentDocument.querySelector("#credits"); return !!c && !c.hasAttribute("data-pe") && c.textContent; }) === "Made with Pixi Editor", "the game shows the new text, without markers");
+      // Again, on the same element: the positions in the file moved
+      await page.evaluate(() => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelector("#credits")));
+      await page.waitForTimeout(300);
+      await field("css:font-size").fill("16px");
+      await field("css:font-size").press("Enter");
+      await ed.save();
+      check(has(read(project, "index.html"), "color: #888; font-size: 16px\">Made with Pixi Editor</div>"), "a second save on the same element", changed(htmlBefore, read(project, "index.html")));
+      await page.waitForTimeout(1500);
+      check(await page.evaluate(() => {
+        const row = document.querySelector("#tree .node.selected");
+        return document.querySelector("#mode-edit").classList.contains("active") && !!row && row._obj && row._obj.id === "credits";
+      }), "after the page reloads, the editor is back in Edit mode on the same element");
+    },
+  },
+  {
+    name: "basic: move and resize HTML",
+    fixture: "basic",
+    async run(ed, project) {
+      const { page } = ed;
+      const menuBefore = read(project, "src/menu.ts");
+      const htmlBefore = read(project, "index.html");
+      await page.waitForTimeout(600);
+      // Page coordinates of an element's box, and the view's zoom (CSS px -> screen px)
+      const box = (sel) => page.evaluate((sel) => {
+        const frame = document.querySelector("#game");
+        const el = frame.contentDocument.querySelector(sel);
+        const f = frame.getBoundingClientRect(), b = el.getBoundingClientRect();
+        const z = f.width / frame.offsetWidth;
+        return { x: f.left + b.left * z, y: f.top + b.top * z, w: b.width * z, h: b.height * z, z };
+      }, sel);
+      const style = (sel, prop) => page.evaluate(([sel, prop]) => document.querySelector("#game").contentDocument.querySelector(sel).style.getPropertyValue(prop), [sel, prop]);
+      const drag = async (x, y, dx, dy) => {
+        await page.mouse.move(x, y);
+        await page.mouse.down();
+        await page.mouse.move(x + dx / 2, y + dy / 2, { steps: 3 });
+        await page.mouse.move(x + dx, y + dy, { steps: 3 });
+        await page.mouse.up();
+        await page.waitForTimeout(200);
+      };
+      const selectEl = (sel) => page.evaluate((sel) => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelector(sel)), sel);
+
+      // 1. Move the menu (position: fixed; right/top in px): right shrinks when moving right
+      await selectEl("button");
+      await selectEl("button").then(() => page.evaluate(() => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelector("button").parentElement)));
+      let b = await box("button");
+      await drag(b.x + b.w / 2, b.y + b.h / 2, -40 * b.z, 30 * b.z);
+      check(await style("button", "right") === "" && (await page.evaluate(() => document.querySelector("#game").contentDocument.querySelector("button").parentElement.style.right)) === "56px", "dragging the menu changes right (it is held by its right edge)");
+      check((await page.evaluate(() => document.querySelector("#game").contentDocument.querySelector("button").parentElement.style.top)) === "46px", "and top");
+      await page.keyboard.press("Control+z");
+      check((await page.evaluate(() => document.querySelector("#game").contentDocument.querySelector("button").parentElement.style.right)) === "16px", "undo puts it back");
+      await page.keyboard.press("Control+Shift+z");
+      await page.keyboard.press("ArrowDown");
+      check((await page.evaluate(() => document.querySelector("#game").contentDocument.querySelector("button").parentElement.style.top)) === "47px", "redo, and arrow keys move it 1px");
+
+      // 2. The button is laid out by the menu (static): it can't be dragged, only resized
+      await selectEl("button");
+      b = await box("button");
+      await drag(b.x + b.w / 2, b.y + b.h / 2, 20 * b.z, 0);
+      check(/placed by its parent/.test(await ed.status()), "a static element says why it can't move", await ed.status());
+      check(await style("button", "left") === "", "and stays as it was");
+      const w0 = await page.evaluate(() => parseFloat(getComputedStyle(document.querySelector("#game").contentDocument.querySelector("button")).width));
+      b = await box("button");
+      await drag(b.x + b.w, b.y + b.h, 30 * b.z, 0); // the SE corner
+      check(await style("button", "width") === `${Math.round(w0 + 30)}px`, "its corner sets a width (it had none) in px", await style("button", "width"));
+
+      const review = await ed.save();
+      const menu = read(project, "src/menu.ts");
+      check(has(menu, 'menu.style.right = "56px";') && has(menu, 'menu.style.top = "47px";'), "menu position written on its lines", changed(menuBefore, menu));
+      check(has(menu, `const playBtn = document.createElement("button");\n  playBtn.style.width = "${Math.round(w0 + 30)}px";`), "button width added after its creation", changed(menuBefore, menu));
+
+      // 3. index.html, with % and vh: the units are kept
+      await page.waitForTimeout(300);
+      await selectEl("#badge");
+      const vp = await page.evaluate(() => { const w = document.querySelector("#game").contentWindow; return { w: w.document.documentElement.clientWidth, h: w.innerHeight }; });
+      b = await box("#badge");
+      await drag(b.x + b.w / 2, b.y + b.h / 2, 50 * b.z, 20 * b.z);
+      const left = await style("#badge", "left"), top = await style("#badge", "top");
+      const near = (v, unit, want) => v.endsWith(unit) && Math.abs(parseFloat(v) - want) < 0.02;
+      check(near(left, "%", 10 + (50 / vp.w) * 100), "left stays in %", `${left} (want ≈${(10 + (50 / vp.w) * 100).toFixed(2)}%)`);
+      check(near(top, "vh", 50 + (20 / vp.h) * 100), "top stays in vh", `${top} (want ≈${(50 + (20 / vp.h) * 100).toFixed(2)}vh)`);
+      // NW corner: wider by 30px to the left, the right edge stays
+      const right0 = await page.evaluate(() => document.querySelector("#game").contentDocument.querySelector("#badge").getBoundingClientRect().right);
+      b = await box("#badge");
+      await drag(b.x, b.y, -30 * b.z, 0);
+      const width = await style("#badge", "width");
+      const right1 = await page.evaluate(() => document.querySelector("#game").contentDocument.querySelector("#badge").getBoundingClientRect().right);
+      check(near(width, "%", 20 + (30 / vp.w) * 100), "width stays in %", width);
+      check(Math.abs(right1 - right0) < 1, "resizing from the left keeps the right edge", `${right0} -> ${right1}`);
+      await ed.save();
+      const html = read(project, "index.html");
+      const leftNow = await style("#badge", "left"), topNow = await style("#badge", "top"), widthNow = await style("#badge", "width");
+      check(has(html, `<div id="badge" style="position: absolute; left: ${leftNow}; top: ${topNow}; width: ${widthNow}; padding: 12px; background: #334; color: #fff">Badge</div>`), "index.html rewritten in place, in % and vh", changed(htmlBefore, html));
+    },
+  },
+  {
+    name: "templates: CSS rules of an element",
+    fixture: "templates",
+    async run(ed, project) {
+      const { page } = ed;
+      const cssBefore = read(project, "src/style.css");
+      const game = (fn, arg) => page.evaluate(([fn, arg]) => new Function("doc", "arg", fn)(document.querySelector("#game").contentDocument, arg), [fn, arg]);
+      const selectEl = (sel) => page.evaluate((sel) => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelector(sel)), sel);
+      const rule = (selector) => page.locator("#inspector .css-rule", { has: page.locator(".css-rule-head code", { hasText: new RegExp(`^${selector.replace(/[.]/g, "\\.")}$`) }) });
+      const field = (selector, prop) => rule(selector).locator(`[data-dprop="css:${prop}"]`).first();
+
+      await selectEl("#play");
+      await page.waitForFunction(() => /style\.css:\d+/.test(document.querySelector("#inspector .css-rule .where")?.textContent || ""), null, { timeout: 10000 });
+      check(await rule(".cta").count() === 1, "the button's CSS rule is listed");
+      check((await rule(".cta").locator(".where").textContent()) === "src/style.css:14", "with its place in the file", await rule(".cta").locator(".where").textContent());
+      check(await field(".cta", "background").inputValue() === "#ff3388", "values as written in the file (not rgb())", await field(".cta", "background").inputValue());
+      await field(".cta", "background").fill("#22aa66");
+      await field(".cta", "background").press("Enter");
+      check(await game("return getComputedStyle(doc.querySelector('#play')).backgroundColor") === "rgb(34, 170, 102)", "the change is live");
+      // picking a suggestion from the list adds the property without Enter
+      await rule(".cta").locator(".dom-add input").evaluate((i) => {
+        i.value = "border-radius";
+        i.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertReplacementText" }));
+      });
+      await field(".cta", "border-radius").fill("6px");
+      await field(".cta", "border-radius").press("Enter");
+
+      // a rule inside @media
+      await selectEl(".title");
+      await page.waitForTimeout(500);
+      check(await rule(".title").count() === 1, "a rule inside @media is listed");
+      await field(".title", "font-size").fill("24px");
+      await field(".title", "font-size").press("Enter");
+
+      // dragging an element placed by a CSS rule changes the rule
+      await selectEl("#panel");
+      await page.waitForTimeout(500);
+      const b = await page.evaluate(() => {
+        const frame = document.querySelector("#game");
+        const el = frame.contentDocument.querySelector("#panel");
+        const f = frame.getBoundingClientRect(), r = el.getBoundingClientRect(), z = f.width / frame.offsetWidth;
+        return { x: f.left + (r.left + r.width / 2) * z, y: f.top + (r.top + r.height / 2) * z, z };
+      });
+      await page.mouse.move(b.x, b.y);
+      await page.mouse.down();
+      await page.mouse.move(b.x + 20 * b.z, b.y + 10 * b.z, { steps: 3 });
+      await page.mouse.move(b.x + 40 * b.z, b.y + 20 * b.z, { steps: 3 });
+      await page.mouse.up();
+      await page.waitForTimeout(200);
+      check(/CSS rule \.panel/.test(await ed.status()), "the status says the rule changes", await ed.status());
+      check(await game("return doc.querySelector('#panel').style.left") === "", "no inline style is added");
+
+      const review = await ed.save();
+      check(review.changes.length === 5, "review lists 5 changes", review.changes.join(", "));
+      const css = read(project, "src/style.css");
+      check(has(css, ".cta { padding: 8px 16px; background: #22aa66; border-radius: 6px; }"), "rule edited and extended on its line", changed(cssBefore, css));
+      check(has(css, "  .title {\n    font-size: 24px;\n  }"), "the @media rule edited", changed(cssBefore, css));
+      check(has(css, "  left: 60px;\n  top: 50px;"), "the drag saved in the .panel rule", changed(cssBefore, css));
+      check(read(project, "src/ui.ts") === fs.readFileSync(path.join(REPO, "test/fixtures/templates/src/ui.ts"), "utf8"), "the template is untouched");
+      check(!(await page.$eval("#btn-save", (b) => !b.disabled)), "nothing left to save");
+      // editing again after saving (new positions in the file)
+      await selectEl("#play");
+      await page.waitForTimeout(400);
+      await field(".cta", "padding").fill("10px 20px");
+      await field(".cta", "padding").press("Enter");
+      await ed.save();
+      check(has(read(project, "src/style.css"), ".cta { padding: 10px 20px; background: #22aa66; border-radius: 6px; }"), "a second save on the same rule");
+    },
+  },
+  {
+    name: "templates: CSS in an inline-injected <style>",
+    fixture: "templates",
+    async run(ed, project) {
+      const { page } = ed;
+      // src/inline-theme.css is imported with ?inline and injected into a hand-built <style> (no
+      // Vite dev id / href): the editor must still find the file and save into it.
+      const cssBefore = read(project, "src/inline-theme.css");
+      const selectEl = (sel) => page.evaluate((sel) => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelector(sel)), sel);
+      const rule = (selector) => page.locator("#inspector .css-rule", { has: page.locator(".css-rule-head code", { hasText: new RegExp(`^${selector.replace(/[.]/g, "\\.")}$`) }) });
+      const field = (selector, prop) => rule(selector).locator(`[data-dprop="css:${prop}"]`).first();
+
+      await selectEl(".hint");
+      await page.waitForFunction(() => /inline-theme\.css:\d+/.test(document.querySelector("#inspector .css-rule .where")?.textContent || ""), null, { timeout: 10000 });
+      check(await rule(".hint").count() === 1, "the inline rule is listed and linked to its file");
+      check((await rule(".hint").locator(".where").textContent()) === "src/inline-theme.css:1", "with its place in the file", await rule(".hint").locator(".where").textContent());
+
+      // The same injected <style> concatenates a second file: its rule links to that file, not the first.
+      await selectEl(".list");
+      await page.waitForFunction(() => /inline-badge\.css:\d+/.test([...document.querySelectorAll("#inspector .css-rule .where")].map((w) => w.textContent).join(" ")), null, { timeout: 10000 });
+      check((await rule(".list").locator(".where").textContent()) === "src/inline-badge.css:1", "a rule from another file in the same <style> links to its own file", await rule(".list").locator(".where").textContent());
+
+      await selectEl(".hint");
+      await page.waitForTimeout(400);
+      await field(".hint", "font-size").fill("18px");
+      await field(".hint", "font-size").press("Enter");
+
+      const review = await ed.save();
+      check(review.changes.length === 1, "review lists the change", review.changes.join(", "));
+      const css = read(project, "src/inline-theme.css");
+      check(has(css, "font-size: 18px;"), "the inline stylesheet's file is rewritten", changed(cssBefore, css));
+      check(!(await page.$eval("#btn-save", (b) => !b.disabled)), "nothing left to save");
+    },
+  },
+  {
+    name: "templates: property hints and making a flow element movable",
+    fixture: "templates",
+    async run(ed, project) {
+      const { page } = ed;
+      const selectEl = (sel) => page.evaluate((sel) => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelector(sel)), sel);
+      const game = (fn) => page.evaluate((fn) => new Function("doc", fn)(document.querySelector("#game").contentDocument), fn);
+      const addField = page.locator("#inspector .dom-add input").first();
+      const styleField = (prop) => page.locator(`#inspector .section:not(:has(.css-rule)) [data-dprop="css:${prop}"]`).first();
+      const makeBtn = page.locator("#inspector button.ghost", { hasText: "Make movable" });
+      const flowNote = page.locator("#inspector .note.warn", { hasText: "Placed by its parent" });
+
+      // .hint is a <p> in normal flow inside the (absolute) .panel: it can't be dragged to move.
+      await selectEl(".hint");
+      await page.waitForTimeout(400);
+      check(await flowNote.count() === 1, "a flow element shows why it can't be moved");
+      check(/normal flow/.test(await flowNote.textContent()), "the note names what places it", await flowNote.textContent());
+      check(await makeBtn.count() === 1, "and offers to make it movable");
+
+      // A freshly added property shows its format as a placeholder hint.
+      await addField.fill("padding-top");
+      await addField.press("Enter");
+      await page.waitForTimeout(300);
+      check(await styleField("padding-top").getAttribute("placeholder") === "e.g. 8px, 1rem", "an added property shows a format hint",
+        await styleField("padding-top").getAttribute("placeholder"));
+
+      // Make it movable: position: relative is applied live and the warning goes away.
+      await makeBtn.click();
+      await page.waitForTimeout(300);
+      check(await styleField("position").inputValue() === "relative", "Make movable sets position: relative", await styleField("position").inputValue());
+      check(await game("return getComputedStyle(doc.querySelector('.hint')).position") === "relative", "the change is live");
+      check(await flowNote.count() === 0, "the element is now movable, so the note is gone");
+    },
+  },
+  {
+    name: "templates: HTML written with innerHTML",
+    fixture: "templates",
+    async run(ed, project) {
+      const { page } = ed;
+      const before = read(project, "src/ui.ts");
+      const selectEl = (sel, i = 0) => page.evaluate(([sel, i]) => window.pixiEditor.select(document.querySelector("#game").contentDocument.querySelectorAll(sel)[i]), [sel, i]);
+      const field = (prop) => page.locator(`#inspector .section:not(:has(.css-rule)) [data-dprop="${prop}"]`).first();
+      await page.waitForTimeout(500);
+      await selectEl("#play"); // opens the path to it in the hierarchy
+      await page.waitForTimeout(700);
+      const rows = await page.$$eval("#tree .node.dom", (r) => r.map((x) => ({ name: x.querySelector(".name").textContent, linked: x.querySelector(".dot").classList.contains("editable") })));
+      check(rows.some((r) => r.name === "#panel" && r.linked) && rows.some((r) => r.name === "#play" && r.linked), "elements from the template are linked", JSON.stringify(rows));
+      check(await page.evaluate(() => document.querySelector("#game").contentDocument.querySelectorAll("[data-pe]").length) === 0, "the editor's markers don't stay in the page");
+
+      await selectEl("#play");
+      await page.waitForSelector("#inspector .src b", { timeout: 10000 });
+      const insp = await page.textContent("#inspector");
+      check(insp.includes("src/ui.ts:7") && /HTML template/.test(insp), "the inspector shows the template line", insp.slice(0, 400));
+      check(await field("attr:textContent").count() === 0, "its text written with ${label} is not editable");
+      await field("attr:title").fill("Go `now` ${x}");
+      await field("attr:title").press("Enter");
+
+      await selectEl(".hint");
+      await page.waitForTimeout(200);
+      await field("attr:textContent").fill("Press <start>");
+      await field("attr:textContent").press("Enter");
+      check(await page.evaluate(() => document.querySelector("#game").contentDocument.querySelector(".hint").textContent) === "Press <start>", "the text changes live");
+
+      await selectEl("#panel");
+      await page.waitForTimeout(200);
+      await page.locator("#inspector .dom-add input").first().fill("outline");
+      await page.locator("#inspector .dom-add input").first().press("Enter");
+      await field("css:outline").fill("1px solid red");
+      await field("css:outline").press("Enter");
+
+      const review = await ed.save();
+      check(review.changes.length === 3, "review lists 3 changes", review.changes.join(", "));
+      const after = read(project, "src/ui.ts");
+      check(has(after, '<button class="cta" id="play" title="Go \\`now\\` \\${x}">${label}</button>'), "attribute saved in the template, escaped for it", changed(before, after));
+      check(has(after, '<p class="hint">Press &lt;start&gt;</p>'), "text saved, HTML-escaped", changed(before, after));
+      check(has(after, '<section class="panel" id="panel" style="outline: 1px solid red">'), "a style added to the tag", changed(before, after));
+      check(!after.includes("data-pe"), "no markers in the file");
+      // the game keeps working with the saved file
+      const mod = await page.evaluate(async () => { const r = await fetch("/src/ui.ts?t=" + Date.now()); return r.ok; });
+      check(mod, "the saved file still compiles");
+
+      // again, on the same tag: positions moved
+      await selectEl("#play");
+      await page.waitForTimeout(300);
+      await field("attr:title").fill("Start");
+      await field("attr:title").press("Enter");
+      await ed.save();
+      check(has(read(project, "src/ui.ts"), '<button class="cta" id="play" title="Start">${label}</button>'), "a second save on the same tag", changed(after, read(project, "src/ui.ts")));
+      // repeated elements from a nested template share their line
+      await selectEl(".item", 1);
+      await page.waitForSelector("#inspector .src b", { timeout: 10000 });
+      check(/affects 2 elements/.test(await page.textContent("#inspector")), "a tag inside .map() says it makes several elements");
+    },
+  },
+  {
+    name: "basic: create HTML in the scene (DOMContainer)",
+    fixture: "basic",
+    async run(ed, project) {
+      const { page } = ed;
+      const before = read(project, "src/hud.ts");
+      check(await ed.select("side"), "select side");
+      await page.click("#btn-create");
+      check(await page.isVisible('#create-menu button[data-kind="htmlButton"]'), "the menu offers HTML objects");
+      await page.click('#create-menu button[data-kind="htmlButton"]');
+      await ed.settle();
+      const created = read(project, "src/hud.ts");
+      check(has(created, 'const button = new DOMContainer({ element: document.createElement("button"), anchor: 0.5 });\n  button.element.textContent = "Button";'), "DOMContainer written with its element", changed(before, created));
+      check(has(created, /button\.element\.style\.cursor = "pointer";\n {2}button\.position\.set\(-?\d+, -?\d+\);\n {2}side\.addChild\(button\);/), "its style, position and parent", changed(before, created));
+      check(has(created, /import \{[^}]*\bDOMContainer\b[^}]*\} from "pixi\.js";/), "DOMContainer imported");
+      const sel = await page.evaluate(() => {
+        const row = document.querySelector("#tree .node.selected");
+        const o = row && row._obj;
+        return o ? { type: row.querySelector(".type").textContent, tag: o.element && o.element.tagName, shown: !!o.element.isConnected } : null;
+      });
+      check(sel && /DOMContainer/.test(sel.type) && sel.tag === "BUTTON" && sel.shown, "the new DOMContainer is selected and its button is on the page", JSON.stringify(sel));
+      const pageRows = await page.$$eval("#tree .node.dom", (r) => r.map((x) => x._obj.tagName));
+      check(!pageRows.includes("BUTTON") || pageRows.filter((t) => t === "BUTTON").length === 1, "its element is not repeated under Page (HTML)", pageRows.join(","));
+
+      // Click on it in the viewport: selects the DOMContainer (not its element)
+      await ed.select("hint");
+      const pt = await page.evaluate(() => {
+        const frame = document.querySelector("#game");
+        const pe = frame.contentWindow.__PIXI_EDITOR__;
+        let btn = null;
+        const walk = (o) => { for (const c of o.children) { if (c.renderPipeId === "dom") btn = c; walk(c); } };
+        walk(pe.apps[0].stage);
+        const f = frame.getBoundingClientRect(), b = btn.element.getBoundingClientRect();
+        const z = f.width / frame.offsetWidth;
+        return { x: f.left + (b.left + b.width / 2) * z, y: f.top + (b.top + b.height / 2) * z };
+      });
+      await page.mouse.click(pt.x, pt.y);
+      await page.waitForTimeout(300);
+      check((await ed.selected())?.name === "button", "clicking its HTML selects the DOMContainer");
+
+      // Edit: the element's text (its line), a new style (new line after the container), the position (its line)
+      const field = (prop) => page.locator(`#inspector [data-dprop="${prop}"]`);
+      check(await field("attr:textContent").count() === 1 && await field("css:background").count() === 1, "the inspector shows the element's text and style");
+      await field("attr:textContent").fill("Play");
+      await field("attr:textContent").press("Enter");
+      // a name typed in the field is added when the field loses focus
+      await page.fill("#inspector .dom-add input", "font-weight");
+      await page.locator("#inspector .dom-add input").evaluate((i) => i.blur());
+      await field("css:font-weight").fill("bold");
+      await field("css:font-weight").press("Enter");
+      await ed.key("Shift+ArrowRight");
+      const x0 = (await ed.selected()).x;
+      const review = await ed.save();
+      check(review.changes.length === 3, "review lists 3 changes", review.changes.join(", "));
+      const after = read(project, "src/hud.ts");
+      check(has(after, 'button.element.textContent = "Play";'), "text written on its line", changed(created, after));
+      check(has(after, /side\.addChild\(button\);\n {2}button\.element\.style\.fontWeight = "bold";/) || has(after, /button\.element\.style\.fontWeight = "bold";/), "new style written after the DOMContainer", changed(created, after));
+      check(has(after, `button.position.set(${x0},`), "position written", changed(created, after));
+      check(!(await page.$eval("#btn-save", (b) => !b.disabled)), "nothing left to save");
+
+      // Duplicate: the copy has its own element, linked to the copied lines
+      await page.keyboard.press("Control+d");
+      await ed.settle();
+      const dup = read(project, "src/hud.ts");
+      check(has(dup, 'const button2 = new DOMContainer({ element: document.createElement("button"), anchor: 0.5 });') && has(dup, 'button2.element.textContent = "Play";') && has(dup, 'button2.element.style.fontWeight = "bold";'), "duplicated with its element lines", changed(after, dup));
+      const copy = await page.evaluate(() => { const o = document.querySelector("#tree .node.selected")._obj; return { tag: o.element.tagName, own: o.element !== o.parent.children[o.parent.getChildIndex(o) - 1].element, shown: o.element.isConnected }; });
+      check(copy.tag === "BUTTON" && copy.own && copy.shown, "the copy shows its own button", JSON.stringify(copy));
+      await field("attr:textContent").fill("Quit");
+      await field("attr:textContent").press("Enter");
+      await ed.save();
+      const dup2 = read(project, "src/hud.ts");
+      check(has(dup2, 'button2.element.textContent = "Quit";') && has(dup2, 'button.element.textContent = "Play";'), "editing the copy changes only its line", changed(dup, dup2));
+      // Delete it: its element lines go too, and it leaves the page
+      await page.keyboard.press("Delete");
+      await page.waitForSelector("#review-modal:not(.hidden)", { timeout: 10000 });
+      await page.keyboard.press("Enter");
+      await ed.settle();
+      const del = read(project, "src/hud.ts");
+      check(!del.includes("button2"), "deleting removes all of its lines", changed(dup2, del));
+      await page.waitForTimeout(300);
+      check(await page.evaluate(() => document.querySelector("#game").contentDocument.querySelectorAll("button").length) === 2, "and its button leaves the page (the menu's and the first one stay)");
+    },
+  },
+  {
     name: "basic: parent and draw order",
     fixture: "basic",
     async run(ed, project) {
@@ -271,6 +738,31 @@ const scenarios = [
       const file = path.join(project, "src/main.ts");
       const cfg = (await prettier.resolveConfig(file)) || {};
       check(await prettier.check(after, { ...cfg, filepath: file }), "file is still Prettier-clean");
+    },
+  },
+  {
+    name: "factory: create HTML in the scene (DOMContainer), Prettier",
+    fixture: "factory",
+    async run(ed, project) {
+      const { page } = ed;
+      const before = read(project, "src/main.ts");
+      check(await ed.select("tray"), "select tray");
+      await page.click("#btn-create");
+      await page.click('#create-menu button[data-kind="htmlInput"]');
+      await ed.settle();
+      const created = read(project, "src/main.ts");
+      check(has(created, "const input = new DOMContainer({ element: document.createElement('input'), anchor: 0.5 });\ninput.element.placeholder = 'Type here';\ninput.element.maxLength = 20;"), "written with the project's quotes", changed(before, created));
+      check(has(created, /import \{[^}]*\bDOMContainer\b[^}]*\} from 'pixi\.js';/), "DOMContainer imported");
+      const prettier = await import("prettier");
+      const file = path.join(project, "src/main.ts");
+      const cfg = (await prettier.resolveConfig(file)) || {};
+      check(await prettier.check(created, { ...cfg, filepath: file }), "file is still Prettier-clean");
+      const field = (prop) => page.locator(`#inspector [data-dprop="${prop}"]`);
+      await field("attr:placeholder").fill("Your name");
+      await field("attr:placeholder").press("Enter");
+      await ed.save();
+      const after = read(project, "src/main.ts");
+      check(has(after, "input.element.placeholder = 'Your name';"), "placeholder saved with single quotes", changed(created, after));
     },
   },
   {

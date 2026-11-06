@@ -10,6 +10,7 @@
 // object they receive.
 import { parse } from "@babel/parser";
 import MagicString from "magic-string";
+import { PH, templateRegistry } from "./html.js";
 
 export const PE = "__pixiEditor$";
 
@@ -106,6 +107,25 @@ function isCreation(node) {
   return false;
 }
 
+// HTML elements: properties the editor can show and save (`el.placeholder = "…"` -> kind "attr:placeholder").
+export const DOM_PROPS = new Set([
+  "textContent", "innerText", "placeholder", "value", "type", "id", "title", "src", "href", "alt",
+  "maxLength", "min", "max", "step", "disabled", "className", "htmlFor",
+]);
+// setAttribute("maxlength", …) names -> the element property the editor uses
+const ATTR_TO_PROP = { class: "className", for: "htmlFor", maxlength: "maxLength", tabindex: "tabIndex" };
+/** CSS property name as the browser lists it: fontSize -> font-size, cssFloat -> float. */
+export const cssName = (p) => (p === "cssFloat" ? "float" : p.startsWith("--") ? p : p.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()));
+const keyName = (k) => (k && (k.type === "Identifier" ? k.name : k.type === "StringLiteral" ? k.value : null)) || null;
+
+/** document.createElement("div") (also window.document…, and inside `as T` casts): an HTML element. */
+export function isDomCreation(node) {
+  const n = unwrapTS(node);
+  if (!n || n.type !== "CallExpression" || n.callee.type !== "MemberExpression" || propName(n.callee) !== "createElement") return false;
+  const doc = unwrapTS(n.callee.object);
+  return (doc.type === "Identifier" && doc.name === "document") || propName(doc) === "document";
+}
+
 // Pointer events: { events: { pointerover: (sp) => … } }, onPointerDown: …, obj.on("pointerout", …)
 const POINTER_EVENT_RE = /^(on)?(pointer|mouse|touch|click|tap|hover|press|release|rightclick|rightdown|rightup)/i;
 const LISTEN_RE = /^(on|once|addListener|addEventListener)$/;
@@ -139,7 +159,7 @@ function lineIndent(code, pos) {
  * Parses and transforms one file.
  * @returns {{ code: string, map: object, sites: object[], decls: object[] } | null}
  */
-export function instrument(code, file, nextId) {
+export function instrument(code, file, nextId, opts = {}) {
   let ast;
   try {
     ast = parse(code, {
@@ -345,8 +365,65 @@ export function instrument(code, file, nextId) {
     return { start: 0, end: code.length };
   }
 
+  // HTML written in strings: `x.innerHTML = \`<div class="a">…\``, outerHTML, insertAdjacentHTML.
+  // Their static tags become code sites; the transformed code carries data-pe markers so the runtime
+  // can tie each element it creates to its tag. Ids are stable per template (opts.htmlIdFor).
+  const tplIdFor = opts.htmlIdFor || ((key, prefix) => nextId(prefix));
+  let tplCount = 0;
+  const tplSeen = new Set();
+  function linkTemplates(rhs) {
+    const found = [];
+    (function find(n) {
+      if (!n || typeof n.type !== "string") return;
+      if (n.type === "TemplateLiteral" || n.type === "StringLiteral") found.push(n);
+      for (const k of Object.keys(n)) {
+        if (SKIP_KEYS.has(k)) continue;
+        const v = n[k];
+        if (Array.isArray(v)) v.forEach(find);
+        else if (v && typeof v.type === "string") find(v);
+      }
+    })(rhs);
+    for (const n of found) {
+      if (tplSeen.has(n.start)) continue;
+      tplSeen.add(n.start);
+      let text, toSource, quote;
+      if (n.type === "StringLiteral") {
+        const inner = code.slice(n.start + 1, n.end - 1);
+        if (inner.includes("\\")) continue; // escapes: positions wouldn't match the HTML
+        text = inner;
+        quote = code[n.start];
+        toSource = (p) => n.start + 1 + p;
+      } else {
+        const segs = [];
+        text = "";
+        n.quasis.forEach((q, i) => {
+          if (i) text += PH;
+          segs.push({ t: text.length, s: q.start, len: q.end - q.start });
+          text += code.slice(q.start, q.end);
+        });
+        quote = "`";
+        toSource = (p) => {
+          for (let i = segs.length - 1; i >= 0; i--) if (p >= segs[i].t) return segs[i].s + Math.min(p - segs[i].t, segs[i].len);
+          return segs[0].s;
+        };
+      }
+      if (!/<[a-zA-Z]/.test(text)) continue;
+      const reg = templateRegistry(text, toSource, code, tplIdFor, `tpl${tplCount++}`, { quote });
+      sites.push(...reg.sites);
+      decls.push(...reg.decls);
+      for (const mk of reg.marks) s.appendLeft(mk.at, mk.text);
+    }
+  }
+
   walk(ast.program, [], (node, parents) => {
     currentParents = parents;
+    // --- x.innerHTML = `…` / x.outerHTML = `…` / x.insertAdjacentHTML("beforeend", `…`)
+    if (node.type === "AssignmentExpression" && (node.operator === "=" || node.operator === "+=") && node.left.type === "MemberExpression" && /^(innerHTML|outerHTML)$/.test(propName(node.left) || "")) {
+      linkTemplates(node.right);
+    }
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && propName(node.callee) === "insertAdjacentHTML" && node.arguments[1]) {
+      linkTemplates(node.arguments[1]);
+    }
     // --- addComponent(E, Type, { ...params })
     if (
       node.type === "CallExpression" && node.callee.type === "Identifier" && node.callee.name === "addComponent" &&
@@ -392,6 +469,40 @@ export function instrument(code, file, nextId) {
       return;
     }
 
+    // --- HTML: E.style.setProperty("color", v) / E.setAttribute("placeholder", v) / Object.assign(E.style, { color: v })
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && !node.callee.computed) {
+      const fn = propName(node.callee);
+      const [a0, a1] = node.arguments;
+      const target = node.callee.object;
+      if (fn === "setProperty" && propName(target) === "style" && target.object.type !== "Super" && a0 && a0.type === "StringLiteral" && a1 && a1.type !== "SpreadElement") {
+        const id = nextId("s");
+        sites.push({ id, kind: `css:${a0.value}`, form: "call", args: [arg(a1)] });
+        wrapObj(target.object, `css:${a0.value}`, id);
+        return;
+      }
+      if (fn === "setAttribute" && target.type !== "Super" && a0 && a0.type === "StringLiteral" && a1 && a1.type !== "SpreadElement" && !["style", "class"].includes(a0.value.toLowerCase())) {
+        const name = ATTR_TO_PROP[a0.value.toLowerCase()] || a0.value;
+        const id = nextId("s");
+        sites.push({ id, kind: `attr:${name}`, form: "call", args: [arg(a1)] });
+        wrapObj(target, `attr:${name}`, id);
+        return;
+      }
+      if (
+        fn === "assign" && target.type === "Identifier" && target.name === "Object" && node.arguments.length === 2 &&
+        a0 && a0.type === "MemberExpression" && propName(a0) === "style" && a0.object.type !== "Super" && a1.type === "ObjectExpression"
+      ) {
+        for (const p of a1.properties) {
+          const key = p.type === "ObjectProperty" && !p.computed ? keyName(p.key) : null;
+          if (!key) continue;
+          const kind = `css:${cssName(key)}`;
+          const id = nextId("s");
+          sites.push({ id, kind, form: "option", args: [arg(p.value)] });
+          wrapObj(a0.object, kind, id);
+        }
+        return;
+      }
+    }
+
     // --- E.position.set(a, b)  /  E.scale.set(a) ...
     if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && propName(node.callee) === "set") {
       const vecMember = node.callee.object;
@@ -426,6 +537,21 @@ export function instrument(code, file, nextId) {
         wrapObj(left.object.object, `style.${prop}`, id);
         return;
       }
+      // E.style.color = v: an HTML element's inline style (the runtime ignores it for Pixi objects)
+      if (inner === "style" && left.object.object.type !== "Super") {
+        const kind = `css:${cssName(prop)}`;
+        const id = nextId("s");
+        sites.push({ id, kind, form: "assign", args: [arg(node.right)] });
+        wrapObj(left.object.object, kind, id);
+        return;
+      }
+      // E.placeholder = v / E.textContent = v: an HTML element's property
+      if (DOM_PROPS.has(prop) && left.object.type !== "Super") {
+        const id = nextId("s");
+        sites.push({ id, kind: `attr:${prop}`, form: "assign", args: [arg(node.right)] });
+        wrapObj(left.object, `attr:${prop}`, id);
+        // (keep going: it may also be a creation, below)
+      }
       // E.x = v  /  E.rotation = v  /  E.scale = v  /  E.text = v
       if ((SCALAR.has(prop) || VEC.has(prop)) && left.object.type !== "Super") {
         const id = nextId("s");
@@ -438,14 +564,14 @@ export function instrument(code, file, nextId) {
     // --- Object creations: const a = new X(), a = new X(), this.a = new X(), field = new X()
     let target = null, init = null, stmt = null;
     const parent = parents[parents.length - 1];
-    if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init && isCreation(node.init)) {
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init && (isCreation(node.init) || isDomCreation(node.init))) {
       target = node.id.name;
       init = node.init;
       if (parent && parent.type === "VariableDeclaration" && parent.declarations.length === 1) {
         const gp = parents[parents.length - 2];
         if (gp && (gp.type === "BlockStatement" || gp.type === "Program" || gp.type === "SwitchCase")) stmt = parent;
       }
-    } else if (node.type === "AssignmentExpression" && node.operator === "=" && isCreation(node.right)) {
+    } else if (node.type === "AssignmentExpression" && node.operator === "=" && (isCreation(node.right) || isDomCreation(node.right))) {
       const l = node.left;
       if (l.type === "Identifier") target = l.name;
       else if (l.type === "MemberExpression" && l.object.type === "ThisExpression" && propName(l)) target = `this.${propName(l)}`;
@@ -453,7 +579,7 @@ export function instrument(code, file, nextId) {
         init = node.right;
         if (parent && parent.type === "ExpressionStatement") stmt = parent;
       }
-    } else if ((node.type === "ClassProperty" || node.type === "PropertyDefinition") && node.value && isCreation(node.value) && node.key.type === "Identifier" && !node.static) {
+    } else if ((node.type === "ClassProperty" || node.type === "PropertyDefinition") && node.value && (isCreation(node.value) || isDomCreation(node.value)) && node.key.type === "Identifier" && !node.static) {
       target = `this.${node.key.name}`;
       init = node.value;
     }
@@ -463,6 +589,7 @@ export function instrument(code, file, nextId) {
       const opts = creationSites(init);
       const root = creationParts(assignWrapper(init)?.inner || init)?.root;
       const factory = root && root.type === "CallExpression" ? calleeName(root) : null;
+      const dom = isDomCreation(init);
       decls.push({
         id,
         name,
@@ -474,6 +601,7 @@ export function instrument(code, file, nextId) {
         end: init.end,
         factory,
         opts,
+        ...(dom ? { dom: true } : {}),
       });
       s.appendLeft(init.start, `${PE}.d(`);
       s.prependRight(init.end, `, ${JSON.stringify(id)}, ${JSON.stringify(name)}, ${JSON.stringify(opts)}${factory ? ", 1" : ""})`);

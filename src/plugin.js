@@ -10,6 +10,8 @@ import { parse, parseExpression } from "@babel/parser";
 import { planEdits, planImport, findLiteral, detectQuote, quoteString, fmt, lineDiff } from "./writeback.js";
 import { FACTORY_RE, instrument as instrumentCode } from "./instrument.js";
 import { analyzeObject, deleteEdits, duplicateEdits, pruneImports, namesIn, moveEdits } from "./refactor.js";
+import { htmlRegistry, markHtml, planHtmlEdits, applyHtmlEdits, jsEscaper } from "./html.js";
+import { cssRegistry, planCssEdits, scanCss, ruleKeys } from "./css.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNTIME = fs.readFileSync(path.resolve(HERE, "runtime.js"), "utf8");
@@ -71,6 +73,151 @@ export default function pixiEditor() {
     byFile.set(file, ids);
   }
 
+  // index.html: its elements' code sites, with ids kept across rescans (element order + kind).
+  const htmlIds = new Map(); // file -> Map(key -> id)
+  /** Registers the elements of an HTML file; returns the markers that tie each tag to its element in the page. */
+  function registerHtml(file, code) {
+    if (!htmlIds.has(file)) htmlIds.set(file, new Map());
+    const ids = htmlIds.get(file);
+    const idFor = (key, prefix) => { if (!ids.has(key)) ids.set(key, nextId(prefix)); return ids.get(key); };
+    const reg = htmlRegistry(code, idFor);
+    register(file, reg.sites, reg.decls);
+    return reg.marks;
+  }
+  const isHtmlFile = (file) => /\.html?$/i.test(file);
+  // HTML in innerHTML templates: stable ids per file (template order + element order + kind)
+  const tplIds = new Map();
+  const tplIdFor = (file) => {
+    if (!tplIds.has(file)) tplIds.set(file, new Map());
+    const ids = tplIds.get(file);
+    return (key, prefix) => { if (!ids.has(key)) ids.set(key, nextId(prefix)); return ids.get(key); };
+  };
+  /** After the editor rewrote a file: the template sites again (same ids, new positions, new ones added). */
+  function refreshTemplates(file, code) {
+    const out = instrument(code, file, () => "x", { htmlIdFor: tplIdFor(file) });
+    if (!out) return [];
+    const ids = byFile.get(file) || new Set();
+    byFile.set(file, ids);
+    const fresh = out.sites.filter((st) => st.tpl);
+    for (const st of fresh) { st.file = file; sites.set(st.id, st); ids.add(st.id); }
+    for (const d of out.decls.filter((x) => x.tpl)) { d.file = file; decls.set(d.id, d); ids.add(d.id); }
+    return fresh;
+  }
+  const isCssFile = (file) => /\.css$/i.test(file);
+
+  // CSS files: their rules' declarations, with ids kept across rescans (rule key + property).
+  const cssIds = new Map(); // file -> Map(key -> id)
+  function registerCss(file, code) {
+    if (!cssIds.has(file)) cssIds.set(file, new Map());
+    const ids = cssIds.get(file);
+    const idFor = (key, prefix) => { if (!ids.has(key)) ids.set(key, nextId(prefix)); return ids.get(key); };
+    const reg = cssRegistry(code, idFor);
+    register(file, reg.sites, reg.decls);
+    return reg;
+  }
+  /** A stylesheet of the game page -> its file: Vite's dev id (an absolute path) or a URL path. */
+  function cssFileOf(ref) {
+    const clean = String(ref || "").split("?")[0];
+    if (!clean || !/\.css$/i.test(clean)) return null;
+    const inRoot = (f) => { const r = path.relative(root, f); return r && !r.startsWith("..") && !path.isAbsolute(r) && fs.existsSync(f) ? f : null; };
+    if (path.isAbsolute(clean) && inRoot(path.normalize(clean))) return path.normalize(clean);
+    const rel = decodeURIComponent(clean.replace(/^https?:\/\/[^/]+/, "")).replace(/^\/+/, "");
+    return inRoot(path.join(root, rel)) || inRoot(path.join(root, "public", rel));
+  }
+  // Inline <style> sheets (CSS imported with ?inline and injected at runtime) carry no file id.
+  // Each rule they hold is matched to the project .css file whose scanned keys contain it.
+  function listCssFiles() {
+    const out = [];
+    const walk = (dir) => {
+      let ents;
+      try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const ent of ents) {
+        if (ent.name === "node_modules" || ent.name.startsWith(".") || ent.name === "dist" || ent.name === "build") continue;
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) walk(full);
+        else if (/\.css$/i.test(ent.name)) out.push(full);
+      }
+    };
+    walk(root);
+    return out;
+  }
+  const cssKeysCache = new Map(); // file -> { mtime, keys: Set }
+  function cssFileKeys(file) {
+    let st;
+    try { st = fs.statSync(file); } catch { return null; }
+    const hit = cssKeysCache.get(file);
+    if (hit && hit.mtime === st.mtimeMs) return hit.keys;
+    let keys;
+    try { keys = new Set(ruleKeys(scanCss(fs.readFileSync(file, "utf8")))); } catch { keys = new Set(); }
+    cssKeysCache.set(file, { mtime: st.mtimeMs, keys });
+    return keys;
+  }
+  /**
+   * Maps each requested rule key to the project .css file that holds it. One injected <style> may
+   * concatenate several files (base.css + sidebar.css + …), so a key is resolved to its own file,
+   * not the whole sheet to one file. A key in several files goes to the one that shares the most of
+   * the sheet's other keys (rules of an element cluster in related files). Returns null when the
+   * sheet is mostly foreign (so an unrelated stylesheet doesn't latch onto a file by a chance rule).
+   */
+  function resolveKeysToFiles(wanted, candidates) {
+    if (!wanted || !wanted.length) return null;
+    const overlap = new Map(); // file -> how many of the sheet's keys it holds
+    const found = new Set();
+    for (const c of candidates) {
+      let h = 0;
+      for (const k of wanted) if (c.keys.has(k)) { h++; found.add(k); }
+      overlap.set(c.file, h);
+    }
+    if (!found.size || found.size * 2 < wanted.length) return null;
+    const map = new Map();
+    for (const k of wanted) {
+      let best = null, bestScore = -1;
+      for (const c of candidates) {
+        if (!c.keys.has(k)) continue;
+        const score = overlap.get(c.file);
+        if (score > bestScore || (score === bestScore && best && c.file < best)) { best = c.file; bestScore = score; }
+      }
+      if (best) map.set(k, best);
+    }
+    return map;
+  }
+
+  /** The rules the editor asks for (by key), with their declarations' code sites. */
+  function cssRules(b) {
+    const out = [];
+    let candidates = null; // [{ file, keys }], scanned once per call if an inline sheet needs matching
+    const regCache = new Map(); // file -> { reg, code }, so each file is read and scanned once
+    const regOf = (file) => {
+      if (!regCache.has(file)) { const code = fs.readFileSync(file, "utf8"); regCache.set(file, { reg: registerCss(file, code), code }); }
+      return regCache.get(file);
+    };
+    for (const sheet of b.sheets || []) {
+      const keys = sheet.keys || [];
+      const direct = cssFileOf(sheet.file);
+      let keyFile = null; // Map(key -> file) when the sheet is an injected one spanning project files
+      if (!direct) {
+        if (!candidates) candidates = listCssFiles().map((file) => ({ file, keys: cssFileKeys(file) || new Set() }));
+        keyFile = resolveKeysToFiles(keys, candidates);
+      }
+      const rules = {};
+      for (const key of keys) {
+        const file = direct || (keyFile && keyFile.get(key));
+        if (!file) continue;
+        const { reg, code } = regOf(file);
+        const d = reg.decls.find((x) => x.key === key);
+        if (!d) continue;
+        const own = reg.sites.filter((x) => x.declId === d.id);
+        rules[key] = {
+          declId: d.id, name: d.name, file: path.relative(root, file), line: lineOf(code, d.start), props: d.props,
+          sites: Object.fromEntries(own.map((x) => [x.kind, x.id])),
+          values: Object.fromEntries(own.map((x) => [x.kind, x.args[0].text])),
+        };
+      }
+      out.push({ file: sheet.file, rules });
+    }
+    return out;
+  }
+
   function lineOf(code, pos) {
     let line = 1;
     for (let i = 0; i < pos && i < code.length; i++) if (code.charCodeAt(i) === 10) line++;
@@ -90,6 +237,7 @@ export default function pixiEditor() {
       id, kind: rec.kind || "decl", name: rec.name,
       file: path.relative(root, rec.file), line, col,
       code: lineText.trim(),
+      arg: rec.args && rec.args[0] && rec.args[0].text.length <= 200 ? rec.args[0].text : null, // the value as written
       canInsert: rec.insertAt != null,
       // A spine chosen by an expression (SPINES[key].SKEL) can't be rewritten by the editor.
       ...(rec.kind === "spine" ? { fixed: rec.args.some((a) => assetText(a.text, ["__probe__"], '"') == null) } : {}),
@@ -298,7 +446,14 @@ export default function pixiEditor() {
     text: { cls: "Text", name: "label" },
     rect: { cls: "Graphics", name: "box" },
     circle: { cls: "Graphics", name: "circle" },
+    // HTML inside the scene: Pixi's DOMContainer moves its element with the game.
+    htmlPanel: { cls: "DOMContainer", name: "panel" },
+    htmlButton: { cls: "DOMContainer", name: "button" },
+    htmlInput: { cls: "DOMContainer", name: "input" },
+    htmlText: { cls: "DOMContainer", name: "note" },
   };
+  // What each HTML kind starts with: [tag, element properties, inline style] (shared with the editor).
+  const HTML_KINDS = JSON.parse(fs.readFileSync(path.resolve(HERE, "../templates/html-kinds.json"), "utf8"));
   const camelName = (text, fallback) => {
     const words = String(text || "").split(/[^A-Za-z0-9]+/).filter(Boolean);
     let n = words.map((w, i) => (i ? w[0].toUpperCase() + w.slice(1) : w[0].toLowerCase() + w.slice(1))).join("");
@@ -387,7 +542,7 @@ export default function pixiEditor() {
       text: [`const ${v} = new Text({ text: ${q(b.text || "New text")}, style: { fill: 0xffffff, fontSize: 32 } });`, `${v}.anchor.set(0.5);`],
       rect: [`const ${v} = new Graphics().rect(-50, -50, 100, 100).fill(0xffffff);`],
       circle: [`const ${v} = new Graphics().circle(0, 0, 50).fill(0xffffff);`],
-    }[b.kind];
+    }[b.kind] || htmlLines(v, HTML_KINDS[b.kind], q);
     lines.push(`${v}.position.set(${x}, ${y});`, `${parent.access}.addChild(${v});`);
     const at = insertionPoint(original, parent);
     const scratch = { applied: [], inserted: [], saved: 0 };
@@ -405,7 +560,7 @@ export default function pixiEditor() {
     decls.set(decl.id, decl);
     ids.add(decl.id);
     const optIds = new Set(Object.values(decl.opts || {}));
-    const newSites = out.sites.filter((st) => st.obj === v || optIds.has(st.id));
+    const newSites = out.sites.filter((st) => st.obj === v || st.obj === `${v}.element` || optIds.has(st.id));
     for (const st of newSites) { st.file = file; sites.set(st.id, st); ids.add(st.id); }
 
     const formatted = await formatLikeProject(file, original, code);
@@ -419,8 +574,19 @@ export default function pixiEditor() {
       declId: decl.id,
       name: v,
       opts: decl.opts || {},
-      sites: newSites.filter((st) => !optIds.has(st.id)).map((st) => ({ kind: st.kind, id: st.id })),
+      sites: newSites.filter((st) => !optIds.has(st.id) && st.obj === v).map((st) => ({ kind: st.kind, id: st.id })),
+      html: HTML_KINDS[b.kind] || null, // what the editor builds live
+      // Sites of the DOMContainer's element: `panel.element.style.padding = …`
+      elementSites: newSites.filter((st) => st.obj === `${v}.element`).map((st) => ({ kind: st.kind, id: st.id })),
     };
+  }
+
+  /** Code for a new DOMContainer: its element, then one line per property and style. */
+  function htmlLines(v, spec, q) {
+    const lines = [`const ${v} = new DOMContainer({ element: document.createElement(${q(spec.tag)}), anchor: 0.5 });`];
+    for (const [k, val] of Object.entries(spec.props || {})) lines.push(`${v}.element.${k} = ${typeof val === "string" ? q(val) : String(val)};`);
+    for (const [k, val] of Object.entries(spec.style || {})) lines.push(`${v}.element.style.${k.replace(/-([a-z])/g, (_, c) => c.toUpperCase())} = ${q(val)};`);
+    return lines;
   }
 
   // ---------------------------------------------------------------- deleting and duplicating objects
@@ -495,11 +661,12 @@ export default function pixiEditor() {
       decls.set(nd.id, nd);
       ids.add(nd.id);
       const optIds = new Set(Object.values(nd.opts || {}));
-      const newSites = out.sites.filter((st) => optIds.has(st.id) || (inRange(st.args[0].start) && (!newName || st.obj === newName)));
+      const newSites = out.sites.filter((st) => optIds.has(st.id) || (inRange(st.args[0].start) && (!newName || st.obj === newName || st.obj === `${newName}.element`)));
       for (const st of newSites) { st.file = file; sites.set(st.id, st); ids.add(st.id); }
       result = {
         ...result, declId: nd.id, name: newName || decl.name, opts: nd.opts || {}, line: lineOf(code, nd.start),
-        sites: newSites.filter((st) => !optIds.has(st.id)).map((st) => ({ kind: st.kind, id: st.id })),
+        sites: newSites.filter((st) => !optIds.has(st.id) && !(newName && st.obj === `${newName}.element`)).map((st) => ({ kind: st.kind, id: st.id })),
+        elementSites: newName ? newSites.filter((st) => st.obj === `${newName}.element`).map((st) => ({ kind: st.kind, id: st.id })) : [],
       };
     } else {
       result.lines = edits.length;
@@ -1071,7 +1238,11 @@ export default function pixiEditor() {
         b.names.add("addComponent");
         b.names.add(e.kind.slice(10));
       }
-      const ins = { decl, kind: e.kind, values: e.values, value: e.value, params: e.params, mode: "stmt", type: e.type };
+      if (/^(css|attr):/.test(e.kind) && decl.insertAt == null) {
+        result.errors.push(`"${decl.name}" has no line of its own to add ${e.kind.replace(/^\w+:/, "")} after.`);
+        continue;
+      }
+      const ins = { decl, kind: e.kind, values: e.values, value: e.value, params: e.params, mode: "stmt", type: e.type, via: e.via === "element" ? "element" : undefined };
       if (decl.insertAt == null && e.kind !== "useApp" && !e.kind.startsWith("component:")) {
         const placed = placeWithoutStatement(decl, e);
         if (placed.error) { result.errors.push(placed.error); continue; }
@@ -1084,10 +1255,60 @@ export default function pixiEditor() {
     let needsCore = false;
     for (const [file, { siteEdits, inserts, names }] of perFile) {
       const original = fs.readFileSync(file, "utf8");
+      if (isCssFile(file)) {
+        // a CSS file: declarations replaced in place, new ones added at the end of their rule
+        const { edits, errors } = planCssEdits(original, siteEdits, inserts);
+        result.errors.push(...errors);
+        if (!edits.length) continue;
+        const code = applyHtmlEdits(original, edits);
+        if (dryRun) { result.diffs.push({ file: path.relative(root, file), hunks: lineDiff(original, code) }); continue; }
+        selfWrites.set(path.normalize(file), code);
+        fs.writeFileSync(file, code);
+        result.files.push(path.relative(root, file));
+        const reg = registerCss(file, code); // same ids, new positions; new properties get new sites
+        for (const ed of edits) if (ed.site) { result.applied.push(ed.site.id); result.saved++; }
+        for (const ins of inserts) {
+          const ns = reg.sites.find((st) => st.declId === ins.decl.id && st.kind === ins.kind);
+          if (ns) { result.inserted.push({ declId: ins.decl.id, kind: ins.kind, siteId: ns.id }); result.saved++; }
+        }
+        continue;
+      }
+      if (isHtmlFile(file)) {
+        // index.html: attributes, style declarations and text of its elements
+        const own = [...(byFile.get(file) || [])].map((id) => sites.get(id)).filter(Boolean);
+        const styleSiteOf = (declId) => own.find((st) => st.declId === declId && st.kind === "html:style") || null;
+        const { edits, errors } = planHtmlEdits(original, siteEdits, inserts, styleSiteOf);
+        result.errors.push(...errors);
+        if (!edits.length) continue;
+        const code = applyHtmlEdits(original, edits);
+        if (dryRun) { result.diffs.push({ file: path.relative(root, file), hunks: lineDiff(original, code) }); continue; }
+        selfWrites.set(path.normalize(file), code);
+        fs.writeFileSync(file, code);
+        result.files.push(path.relative(root, file));
+        registerHtml(file, code); // same ids, new positions; new properties get new sites
+        const now = [...(byFile.get(file) || [])].map((id) => sites.get(id)).filter(Boolean);
+        for (const ed of edits) if (ed.site) { result.applied.push(ed.site.id); result.saved++; }
+        for (const ins of inserts) {
+          const ns = now.find((st) => st.declId === ins.decl.id && st.kind === ins.kind);
+          if (ns) { result.inserted.push({ declId: ins.decl.id, kind: ins.kind, siteId: ns.id }); result.saved++; }
+        }
+        continue;
+      }
       const ctx = { quote: detectQuote(original), failed: result.failed, pixiNames: new Set() };
       ctx.resolve = (site, value, type, code) => resolveValue(site, value, type, code, ctx);
-      const { edits, errors } = planEdits(original, siteEdits, inserts, ctx);
+      // HTML written in templates (innerHTML) is rewritten as HTML, escaped for its JS string
+      const isTpl = (e) => (e.site && e.site.tpl) || (e.decl && e.decl.tpl);
+      const { edits, errors } = planEdits(original, siteEdits.filter((e) => !isTpl(e)), inserts.filter((e) => !isTpl(e)), ctx);
       result.errors.push(...errors);
+      const tplSiteEdits = siteEdits.filter(isTpl), tplInserts = inserts.filter(isTpl);
+      for (const quote of new Set([...tplSiteEdits.map((e) => e.site.jsQuote), ...tplInserts.map((e) => e.decl.jsQuote)])) {
+        const own = [...(byFile.get(file) || [])].map((id) => sites.get(id)).filter(Boolean);
+        const styleSiteOf = (declId) => own.find((st) => st.declId === declId && st.kind === "html:style") || null;
+        const r = planHtmlEdits(original, tplSiteEdits.filter((e) => e.site.jsQuote === quote), tplInserts.filter((e) => e.decl.jsQuote === quote), styleSiteOf,
+          { attrQuote: quote === '"' ? "'" : '"', escape: jsEscaper(quote), where: path.relative(root, file) });
+        result.errors.push(...r.errors);
+        edits.push(...r.edits);
+      }
       if (!edits.length) continue;
       let code = apply(file, original, edits, result);
       if (ctx.pixiNames.size) {
@@ -1120,6 +1341,13 @@ export default function pixiEditor() {
       selfWrites.set(path.normalize(file), code);
       fs.writeFileSync(file, code);
       result.files.push(path.relative(root, file));
+      if (tplSiteEdits.length || tplInserts.length) {
+        const fresh = refreshTemplates(file, code);
+        for (const ins of tplInserts) {
+          const ns = fresh.find((st) => st.declId === ins.decl.id && st.kind === ins.kind);
+          if (ns) { result.inserted.push({ declId: ins.decl.id, kind: ins.kind, siteId: ns.id }); result.saved++; }
+        }
+      }
     }
 
     if (dryRun) {
@@ -1143,8 +1371,15 @@ export default function pixiEditor() {
 
     transformIndexHtml: {
       order: "pre",
-      handler() {
-        return [{ tag: "script", children: RUNTIME, injectTo: "head-prepend" }];
+      handler(html, ctx) {
+        const tags = [{ tag: "script", children: RUNTIME, injectTo: "head-prepend" }];
+        // Mark the page's own elements so the editor can show and save them (only when the HTML is
+        // exactly the file on disk: the positions must match it).
+        const file = ctx && ctx.filename;
+        let disk = null;
+        try { disk = file ? fs.readFileSync(file, "utf8") : null; } catch { /* virtual page */ }
+        if (disk == null || disk !== html) return tags;
+        return { html: markHtml(html, registerHtml(file, html)), tags };
       },
     },
 
@@ -1205,7 +1440,7 @@ export default function pixiEditor() {
       if (!/\.(m?[jt]sx?)$/.test(file) || file.includes("/node_modules/") || !file.startsWith(root)) return null;
       // The editor's own files (templates, runtime) are never instrumented; its test fixtures are.
       if (EDITOR_DIRS.some((d) => file.startsWith(d + path.sep))) return null;
-      const out = instrument(code, file, nextId);
+      const out = instrument(code, file, nextId, { htmlIdFor: tplIdFor(file) });
       if (!out) { register(file, [], [], code); return null; }
       register(file, out.sites, out.decls, code);
       return { code: out.code, map: out.map };
@@ -1246,6 +1481,10 @@ export default function pixiEditor() {
           req.on("end", () => { try { resolve(JSON.parse(body || "{}")); } catch { resolve({}); } });
         });
         const sendJson = (obj) => { res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify(obj)); };
+        if (url.pathname === `${BASE}api/css-rules` && req.method === "POST") {
+          readJson().then((b) => { try { sendJson({ ok: true, sheets: cssRules(b) }); } catch (err) { sendJson({ ok: false, error: String(err.message || err) }); } });
+          return;
+        }
         if (url.pathname === `${BASE}api/open-in-ide` && req.method === "POST") {
           readJson().then(async (b) => sendJson(await openInIde(b.file, b.line, b.col)));
           return;

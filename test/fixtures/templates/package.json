@@ -1,0 +1,12 @@
+{
+  "name": "fixture-templates",
+  "private": true,
+  "type": "module",
+  "description": "Pixi Editor test fixture: HTML from innerHTML templates, look from a CSS file (dependencies come from the editor's own node_modules)",
+  "dependencies": {
+    "pixi.js": "*"
+  },
+  "devDependencies": {
+    "vite": "*"
+  }
+}

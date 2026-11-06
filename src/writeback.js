@@ -89,6 +89,17 @@ export function literalValue(orig, value, type, quote = '"') {
     if (node.type === "NumericLiteral") return quoteString(value, quote);
     return null;
   }
+  if (type === "dom") {
+    // HTML style/property: keep the literal's kind ("8px", 20, true, `text`)
+    const v = String(value);
+    const numeric = /^-?\d+(\.\d+)?$/.test(v);
+    if (node.type === "StringLiteral") return quoteString(v, orig[0]);
+    if (node.type === "TemplateLiteral" && !node.expressions.length) return quoteString(v, "`");
+    const isNum = node.type === "NumericLiteral" || (node.type === "UnaryExpression" && node.operator === "-" && node.argument.type === "NumericLiteral");
+    if (isNum) return numeric ? v : quoteString(v, quote);
+    if (node.type === "BooleanLiteral" && (v === "true" || v === "false")) return v;
+    return null;
+  }
   if (type === "color") {
     if (node.type === "NumericLiteral") return `0x${hex6(value)}`;
     if (node.type === "StringLiteral") {
@@ -251,6 +262,20 @@ export function planEdits(code, siteEdits, inserts, ctx = {}) {
       const prefix0 = `\n${decl.indent}`;
       if (ins.kind === "useApp") {
         text += `${prefix0}useApp(${decl.access});`;
+        continue;
+      }
+      if (ins.kind.startsWith("css:") || ins.kind.startsWith("attr:")) {
+        // HTML: el.style.fontSize = "12px" / el.style.setProperty("--x", "1") / el.placeholder = "…"
+        const name = ins.kind.slice(ins.kind.indexOf(":") + 1);
+        const access = ins.via === "element" ? `${decl.access}.element` : decl.access; // a DOMContainer's element
+        const v = typeof ins.value === "number" ? fmt(ins.value, 3) : typeof ins.value === "boolean" ? String(ins.value) : quoteString(ins.value, quote);
+        let head, tail = ";", form = "assign";
+        if (ins.kind.startsWith("attr:")) head = `${access}.${name} = `;
+        else if (/^[a-z]+(-[a-z]+)*$/.test(name)) head = `${access}.style.${name.replace(/-([a-z])/g, (_, c) => c.toUpperCase())} = `;
+        else { head = `${access}.style.setProperty(${quoteString(name, quote)}, `; tail = ");"; form = "call"; }
+        const rel = text.length + prefix0.length + head.length;
+        newSites.push({ kind: ins.kind, form, declId: decl.id, args: [{ relStart: rel, text: v }] });
+        text += `${prefix0}${head}${v}${tail}`;
         continue;
       }
       if (STRING_KINDS.has(ins.kind) || COLOR_KINDS.has(ins.kind)) {

@@ -13,6 +13,7 @@ const state = {
   win: null, pe: null, app: null,
   mode: "edit",
   selected: null, hover: null,
+  domSelected: null, // an HTML element of the game's page (shown read-only)
   pending: new Map(), // key -> { obj, prop, original, current }
   undo: [], redo: [],
   expanded: new WeakSet(),
@@ -76,6 +77,8 @@ function fillInstructions(o) {
 }
 function propDef(p) {
   if (PROPS[p]) return PROPS[p];
+  const dm = /^(css|attr):(.+)$/.exec(p);
+  if (dm) return dm[1] === "css" ? cssProp(dm[2]) : attrProp(dm[2]);
   const m = /^gfill:(\d+)$/.exec(p);
   if (!m) throw new Error(`Unknown property ${p}`);
   const n = Number(m[1]);
@@ -93,7 +96,8 @@ function propDef(p) {
 // Value properties are saved by replacing a literal, not by adjusting a number.
 const VALUE_TYPE = { text: "string", label: "string", tint: "color", textFill: "color", texture: "texture", parent: "parent", spine: "spine", order: "order",
   animation: "string", fontFamily: "string", fontWeight: "string", fontStyle: "string", align: "string" };
-const valueTypeOf = (p) => VALUE_TYPE[p] || (p.startsWith("gfill:") ? "color" : null);
+const isDomProp = (p) => /^(css|attr):/.test(p); // HTML element: inline style / element property
+const valueTypeOf = (p) => VALUE_TYPE[p] || (p.startsWith("gfill:") ? "color" : isDomProp(p) ? "dom" : null);
 const sameValue = (a, b) => (typeof a === "number" && typeof b === "number" ? Math.abs(a - b) < 1e-9 : a === b);
 
 const colorCtx = document.createElement("canvas").getContext("2d");
@@ -135,7 +139,7 @@ const CANDIDATES = {
 const ASSET_PROPS = new Set(["texture", "parent", "spine"]);
 // Shown only for some kinds of objects (spines, texts): not listed as "missing" for the others.
 const OPTIONAL_PROPS = new Set(["animation", "fontFamily", "fontSize", "fontWeight", "fontStyle", "align", "letterSpacing", "lineHeight"]);
-const candidatesOf = (p) => CANDIDATES[p] || (p.startsWith("gfill:") ? [[p]] : []);
+const candidatesOf = (p) => CANDIDATES[p] || (p.startsWith("gfill:") || isDomProp(p) ? [[p]] : []);
 const INSERT_GROUP = {
   x: "position", y: "position", scaleX: "scale", scaleY: "scale", rotation: "rotation", alpha: "alpha",
   pivotX: "pivot", pivotY: "pivot", anchorX: "anchor", anchorY: "anchor",
@@ -218,7 +222,7 @@ const uid = (o) => {
 };
 const metaOf = (o) => (state.pe && o ? state.pe.meta(o) : null);
 const isEditable = (o) => { const m = metaOf(o); return !!(m && (m.declId || Object.keys(m.sites).length)); };
-const typeOf = (o) => ((o && o.constructor && o.constructor.name) || "Object").replace(/^_+/, "");
+const typeOf = (o) => (isDom(o) ? (o === domPage() ? "HTML" : `<${o.tagName.toLowerCase()}>`) : ((o && o.constructor && o.constructor.name) || "Object").replace(/^_+/, ""));
 /** A label set by the game or the user (Pixi gives some classes a default label equal to the class name). */
 const customLabel = (o) => {
   const l = o && o.label;
@@ -228,11 +232,13 @@ const customLabel = (o) => {
 };
 const nameOf = (o) => {
   if (state.app && o === state.app.stage) return "Stage";
+  if (isDom(o)) return domName(o);
   const m = metaOf(o);
   return customLabel(o) || (m && m.name) || typeOf(o);
 };
 const isModified = (o) => {
-  for (const p of state.pending.values()) if (p.obj === o) return true;
+  const el = domElementOf(o); // a DOMContainer's changes include its element's
+  for (const p of state.pending.values()) if (p.obj === o || (el && p.obj === el)) return true;
   return compChanges().some((c) => c.obj === o);
 };
 
@@ -247,7 +253,7 @@ iframe.addEventListener("load", () => {
   if (!state.project || !iframe.getAttribute("src")) return;
   state.win = state.pe = state.app = null;
   state.mode = "play"; // let the game boot (loading screens, tweens…); switch to Edit when ready
-  state.selected = state.hover = null;
+  state.selected = state.hover = state.domSelected = null;
   state.pending.clear(); state.undo = []; state.redo = [];
   state.compOriginal.clear(); state.compMod = null;
   state.info.clear();
@@ -265,6 +271,7 @@ iframe.addEventListener("load", () => {
       clearInterval(pollTimer);
       state.win = win; state.pe = pe; state.app = app;
       state.expanded.add(app.stage);
+      if (win.document.body) state.expanded.add(win.document.body);
       c.className = "connecting hidden";
       win.addEventListener("keydown", onKey, true);
       setMode(state.mode);
@@ -272,6 +279,20 @@ iframe.addEventListener("load", () => {
       applyMute();
       if (state.afterReload) { setStatus(state.afterReload, "ok"); state.afterReload = null; }
       else setStatus(`Connected to ${state.project ? state.project.name : "the game"} — the game is running. Press Edit (Ctrl/Cmd+E) to select objects.`);
+      if (state.backToEdit) {
+        // Saving index.html reloads the page (Vite always does for HTML): come back to the same element.
+        const path = state.backToEdit.path;
+        const msg = [statusEl.textContent, statusEl.className];
+        state.backToEdit = null;
+        setTimeout(() => {
+          if (state.win !== win) return;
+          setMode("edit");
+          setStatus(...msg);
+          let el = win.document.body;
+          for (const i of path) el = el && el.children[i];
+          if (el && path.length) select(el);
+        }, 600);
+      }
       loadComponents();
     } else if (tries === 40) {
       c.textContent = pe
@@ -388,10 +409,26 @@ function eventPoint(e) {
 }
 function boundsOf(o) {
   try {
+    if (domElementOf(o)) return domContainerBounds(o);
     const b = o.getBounds();
     if (!isFinite(b.minX) || !isFinite(b.maxX) || b.maxX - b.minX <= 0 && b.maxY - b.minY <= 0) return null;
     return b;
   } catch { return null; }
+}
+
+/**
+ * A DOMContainer's box in Pixi global coordinates. Pixi's own bounds ignore the anchor (the element
+ * is drawn shifted by anchor × size), so they would not match what is on screen.
+ */
+function domContainerBounds(o) {
+  const el = o.element;
+  const w = el.offsetWidth, h = el.offsetHeight;
+  if (!w && !h) return null;
+  const ax = w * (o.anchor ? o.anchor.x : 0), ay = h * (o.anchor ? o.anchor.y : 0);
+  const t = o.worldTransform;
+  const pts = [[-ax, -ay], [w - ax, -ay], [-ax, h - ay], [w - ax, h - ay]].map(([x, y]) => [t.a * x + t.c * y + t.tx, t.b * x + t.d * y + t.ty]);
+  const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
+  return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) };
 }
 
 /** Every object under the point, top-most first (each resolved to its editable ancestor). */
@@ -665,8 +702,13 @@ function buildSave() {
       if (site) {
         siteEdits.set(site.id, { siteId: site.id, value: p.current, valueType: vtype });
         plan.push({ key, target: site.id });
-      } else if (meta && meta.declId && INSERT_GROUP[p.prop]) {
-        const kind = INSERT_GROUP[p.prop];
+      } else if (isDomProp(p.prop) && domHostOf(p.obj) && metaOf(domHostOf(p.obj))?.declId) {
+        // a DOMContainer's element: `panel.element.style.color = …` after the container's creation
+        const hostDecl = metaOf(domHostOf(p.obj)).declId;
+        inserts.set(`${hostDecl}:${p.prop}`, { declId: hostDecl, kind: p.prop, value: p.current, obj: p.obj, type: "DOMContainer", via: "element" });
+        plan.push({ key, target: hostDecl });
+      } else if (meta && meta.declId && (INSERT_GROUP[p.prop] || isDomProp(p.prop))) {
+        const kind = INSERT_GROUP[p.prop] || p.prop;
         inserts.set(`${meta.declId}:${kind}`, { declId: meta.declId, kind, value: p.current, obj: p.obj, type: typeOf(p.obj) });
         plan.push({ key, target: meta.declId });
       } else {
@@ -771,9 +813,16 @@ async function saveNow({ reviewed = false } = {}) {
     return;
   }
 
+  // Saving index.html reloads the game page: remember where we were.
+  if ((res.files || []).some((f) => /\.html?$/i.test(f))) {
+    const path = [];
+    for (let el = state.domSelected; el && el.parentElement; el = el.parentElement) path.unshift([...el.parentElement.children].indexOf(el));
+    state.backToEdit = { path: state.domSelected && state.domSelected.isConnected ? path.slice(1) : [] };
+    state.afterReload = `Saved to ${res.files.join(", ")} — the page reloaded`;
+  }
   // New lines become the site for that property.
   for (const ins of res.inserted || []) {
-    for (const i of inserts.values()) if (i.obj && i.declId === ins.declId && i.kind === ins.kind) state.pe.s(i.obj, ins.kind, ins.siteId);
+    for (const i of inserts.values()) if (i.obj && i.declId === ins.declId && i.kind === ins.kind) linkSite(i.obj, ins.kind, ins.siteId);
   }
   const done = new Set([...(res.applied || []), ...(res.inserted || []).map((i) => i.declId)]);
   for (const { key, target } of plan) if (done.has(target)) state.pending.delete(key);
@@ -919,7 +968,7 @@ async function openReview() {
       row.className = "change";
       row.innerHTML = `<div class="what"><span class="obj"></span><span class="val"></span></div><button class="ghost">Discard</button>`;
       if (it.rec) {
-        row.querySelector(".obj").textContent = `${nameOf(it.obj)} · ${PROP_LABEL[it.rec.prop] || it.rec.prop.replace(/^gfill:(\d+)$/, (_, n) => `fill ${+n + 1}`)}`;
+        row.querySelector(".obj").textContent = `${nameOf(it.obj)} · ${PROP_LABEL[it.rec.prop] || it.rec.prop.replace(/^gfill:(\d+)$/, (_, n) => `fill ${+n + 1}`).replace(/^(css|attr):/, "")}`;
         row.querySelector(".val").textContent = `${showValue(it.rec.prop, it.rec.original)} → ${showValue(it.rec.prop, it.rec.current)}`;
       } else {
         row.querySelector(".obj").textContent = `${nameOf(it.obj)} · ${it.c.type}`;
@@ -975,6 +1024,7 @@ function resizeGizmo() {
 new ResizeObserver(resizeGizmo).observe(overlay);
 
 function rectOf(o) {
+  if (isDom(o)) return domRect(o);
   const b = boundsOf(o);
   if (!b) return null;
   const a = globalToOverlay(b.minX, b.minY), z = globalToOverlay(b.maxX, b.maxY);
@@ -1048,6 +1098,13 @@ function handlesOf(r) {
 }
 /** Which gizmo handle of the selected object is under the overlay point, if any. */
 function handleAt(pt) {
+  const del = state.domSelected;
+  if (del && del.isConnected && state.mode === "edit") {
+    const r = rectOf(del);
+    if (!r) return null;
+    for (const h of domHandles(r, domLayout(del).movable)) if (Math.abs(pt.x - h.x) <= 7 && Math.abs(pt.y - h.y) <= 7) return { ...h, dom: true };
+    return null;
+  }
   const sel = state.selected;
   if (!sel || sel.destroyed || state.mode !== "edit") return null;
   const r = rectOf(sel);
@@ -1099,7 +1156,7 @@ function draw() {
   ctx.lineWidth = 1;
   ctx.strokeRect(c0.x + 0.5, c0.y + 0.5, c1.x - c0.x - 1, c1.y - c0.y - 1);
 
-  if (state.hover && state.hover !== state.selected) {
+  if (state.hover && state.hover !== (state.selected || state.domSelected)) {
     const r = rectOf(state.hover);
     if (r) {
       ctx.strokeStyle = "rgba(96,165,250,0.8)";
@@ -1153,6 +1210,35 @@ function draw() {
       ctx.lineWidth = 1; ctx.stroke();
     }
   }
+  const dsel = state.domSelected;
+  if (dsel && dsel.isConnected) {
+    // HTML element: outline, size and the corners that resize it. A locked (flow/flex/grid) element
+    // gets a dashed blue outline so it reads differently from a free, movable one.
+    const r = rectOf(dsel);
+    if (r) {
+      const L = domLayout(dsel);
+      const tint = L.movable ? "#f5b04a" : "#9aa7ff";
+      ctx.strokeStyle = tint;
+      ctx.lineWidth = 1.5;
+      if (!L.movable) ctx.setLineDash([5, 4]);
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+      ctx.setLineDash([]);
+      for (const h of domHandles(r, L.movable)) {
+        ctx.fillStyle = "#fff"; ctx.fillRect(h.x - 4, h.y - 4, 8, 8);
+        ctx.strokeStyle = tint; ctx.strokeRect(h.x - 4 + 0.5, h.y - 4 + 0.5, 7, 7);
+      }
+      const b = dsel.getBoundingClientRect();
+      const label = `${nameOf(dsel)} ${typeOf(dsel)}  ${Math.round(b.width)} × ${Math.round(b.height)}`
+        + (L.movable ? "" : `   ⟂ in ${L.container}`);
+      ctx.font = "11px ui-monospace, Menlo, monospace";
+      const w = ctx.measureText(label).width + 10;
+      const ly = r.y - 20 < 2 ? r.y + r.h + 4 : r.y - 20;
+      ctx.fillStyle = "rgba(20,22,26,0.92)";
+      ctx.fillRect(r.x, ly, w, 16);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(label, r.x + 5, ly + 12);
+    }
+  }
   if (state.drag && state.drag.axis) {
     const d = state.drag;
     ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -1182,6 +1268,7 @@ overlay.addEventListener("pointermove", (e) => {
     if (!d.moved && Math.hypot(dx, dy) < 3) return;
     d.moved = true;
     overlay.classList.add("dragging");
+    if (d.type === "dom") { domDragMove(d, dx, dy, e.shiftKey); return; }
     if (d.type === "move") {
       if (e.shiftKey) { d.axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y"; } else d.axis = null;
       if (d.axis === "x") dy = 0;
@@ -1235,7 +1322,7 @@ overlay.addEventListener("pointermove", (e) => {
   if (h) { overlay.style.cursor = h.cursor; state.hover = null; return; }
   overlay.style.cursor = state.spaceDown ? "grab" : "";
   const g = overlayToGlobal(pt.x, pt.y);
-  state.hover = pick(g.x, g.y);
+  state.hover = pickDom(pt) || pick(g.x, g.y);
   overlay.classList.toggle("over-object", !!state.hover && state.hover === state.selected);
 });
 overlay.addEventListener("pointerleave", () => { state.hover = null; });
@@ -1253,6 +1340,11 @@ overlay.addEventListener("pointerdown", (e) => {
   }
   if (e.button !== 0) return;
   const h = handleAt(pt);
+  if (h && h.dom) {
+    overlay.setPointerCapture(e.pointerId);
+    state.drag = domDragStart(state.domSelected, pt, "size", h.id);
+    return;
+  }
   if (h) {
     const o = state.selected;
     overlay.setPointerCapture(e.pointerId);
@@ -1271,6 +1363,13 @@ overlay.addEventListener("pointerdown", (e) => {
   const g = overlayToGlobal(pt.x, pt.y);
   // Pressing inside the current selection drags it, even if something else is on top
   // (a click without dragging still selects the top-most object, on pointerup).
+  const dsel = state.domSelected;
+  const dr = dsel && dsel.isConnected && !e.altKey ? rectOf(dsel) : null;
+  if (dr && pt.x >= dr.x && pt.x <= dr.x + dr.w && pt.y >= dr.y && pt.y <= dr.y + dr.h) {
+    overlay.setPointerCapture(e.pointerId);
+    state.drag = domDragStart(dsel, pt, "move", null, g);
+    return;
+  }
   const sel = state.selected;
   const sb = sel && !e.altKey && state.tool === "move" ? boundsOf(sel) : null;
   if (sb && g.x >= sb.minX && g.x <= sb.maxX && g.y >= sb.minY && g.y <= sb.maxY && sel.parent) {
@@ -1286,10 +1385,15 @@ overlay.addEventListener("pointerdown", (e) => {
     target = all.length ? all[(i + 1) % all.length] : null;
     if (all.length > 1) setStatus(`${all.indexOf(target) + 1} of ${all.length} objects here — Alt+click again for the next one`);
   } else {
-    target = pick(g.x, g.y);
+    target = pickDom(pt) || pick(g.x, g.y); // HTML elements are drawn above the canvas
   }
   select(target);
-  if (target && target.parent) {
+  if (target && isDom(target)) {
+    overlay.setPointerCapture(e.pointerId);
+    state.drag = domDragStart(target, pt, "move");
+    return;
+  }
+  if (target && !isDom(target) && target.parent) {
     overlay.setPointerCapture(e.pointerId);
     state.drag = { type: "move", obj: target, startPt: pt, before: readVals(target, ["x", "y"]), compBefore: compSnapshot(target), moved: false, axis: null };
   }
@@ -1300,8 +1404,9 @@ overlay.addEventListener("pointerup", (e) => {
   const d = state.drag;
   state.drag = null;
   overlay.classList.remove("dragging");
-  if (d && !d.moved && d.clickPick) { select(pick(d.clickPick.x, d.clickPick.y)); return; }
+  if (d && !d.moved && d.clickPick) { select(pickDom(d.startPt) || pick(d.clickPick.x, d.clickPick.y)); return; }
   if (!d || !d.moved) return;
+  if (d.type === "dom") { domDragEnd(d); return; }
   if (d.type === "move") {
     if (getComp(d.obj, "Anchor")) commit(d.obj, {}, {}, d.compBefore, compSnapshot(d.obj));
     else commit(d.obj, d.before, readVals(d.obj, ["x", "y"]));
@@ -1347,6 +1452,15 @@ function onKey(e) {
   const sel = state.selected;
   const step = e.shiftKey ? 10 : 1;
   const arrows = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+  if (state.domSelected && arrows[e.key]) {
+    // HTML: CSS pixels, in the unit the code uses
+    e.preventDefault();
+    const d = domDragStart(state.domSelected, { x: 0, y: 0 }, "move");
+    const z = state.view.z;
+    domDragMove(d, arrows[e.key][0] * z, arrows[e.key][1] * z, false);
+    domDragEnd(d);
+    return;
+  }
   if (sel && arrows[e.key]) {
     e.preventDefault();
     const before = readVals(sel, ["x", "y"]);
@@ -1362,13 +1476,319 @@ window.addEventListener("beforeunload", (e) => { if (pendingCount() && !state.st
 
 // ---------------------------------------------------------------- selection
 function select(o) {
-  if (state.selected === o) return;
-  state.selected = o;
+  const dom = isDom(o) ? o : null; // an HTML element of the page, or a Pixi object
+  if (state.selected === (dom ? null : o) && state.domSelected === dom) return;
+  state.selected = dom ? null : o;
+  state.domSelected = dom;
   if (o) { state.fileView = null; for (const r of document.querySelectorAll("#files .file.selected")) r.classList.remove("selected"); filesState.selected = null; }
   markLinkedFile(o);
-  if (o) { let p = o.parent; while (p) { state.expanded.add(p); p = p.parent; } }
+  if (dom) { let p = dom.parentElement; while (p) { state.expanded.add(p); p = p.parentElement; } }
+  else if (o) { let p = o.parent; while (p) { state.expanded.add(p); p = p.parent; } }
   renderTree(true); // rebuilds only if expanding changed the tree; otherwise just moves the highlight
   renderInspector();
+}
+
+// ---------------------------------------------------------------- HTML elements of the page
+// Menus, forms and HUDs the game builds with the DOM (document.createElement) sit on top of the
+// canvas, outside Pixi's scene. They are listed under "Page (HTML)" in the hierarchy and can be
+// selected and inspected; changing and saving them is not supported yet.
+const DOM_SKIP = new Set(["SCRIPT", "STYLE", "LINK", "META", "NOSCRIPT", "TEMPLATE", "BR", "TITLE", "HEAD"]);
+const domHidden = new WeakMap(); // element -> its inline `visibility` before the editor hid it
+function isDom(o) { return !!o && typeof o === "object" && o.nodeType === 1 && typeof o.getBoundingClientRect === "function"; }
+function domPage() {
+  try { return (state.win && state.win.document && state.win.document.body) || null; } catch { return null; }
+}
+// DOMContainers (Pixi's HTML inside the scene): their element is edited as part of the container.
+let hostCache = { at: -1, map: new Map() };
+/** element -> the DOMContainer that shows it (scanned at most once per frame). */
+function domHostMap() {
+  const now = performance.now();
+  if (now - hostCache.at < 16 || !state.app) return hostCache.map;
+  const map = new Map();
+  (function walk(o) {
+    for (const c of o.children || []) {
+      if (c.renderPipeId === "dom" && isDom(c.element)) map.set(c.element, c);
+      walk(c);
+    }
+  })(state.app.stage);
+  hostCache = { at: now, map };
+  return map;
+}
+const domHostOf = (el) => (isDom(el) ? domHostMap().get(el) || null : null);
+const domElementOf = (o) => (o && o.renderPipeId === "dom" && isDom(o.element) ? o.element : null);
+/** Pixi's layer next to the canvas that holds every DOMContainer's element. */
+function isPixiDomLayer(el) {
+  if (!el.childElementCount) return false;
+  const hosts = domHostMap();
+  return [...el.children].every((c) => hosts.has(c));
+}
+
+function isGameCanvas(el) {
+  if (el.tagName !== "CANVAS") return false;
+  if (state.app && state.app.canvas === el) return true;
+  return !!state.pe && state.pe.apps.some((a) => { try { return a.renderer && a.canvas === el; } catch { return false; } });
+}
+const hasGameCanvas = (el) => [...el.getElementsByTagName("canvas")].some(isGameCanvas);
+/** Listed in the hierarchy: not a script/style, not the game's canvas, not a wrapper that only holds the canvas. */
+function domShown(el) {
+  if (DOM_SKIP.has(el.tagName) || isGameCanvas(el)) return false;
+  if (domHostMap().has(el) || isPixiDomLayer(el)) return false; // shown in the scene, as its DOMContainer
+  if (!el.getElementsByTagName("canvas").length) return true;
+  return domKids(el).length > 0 || !hasGameCanvas(el);
+}
+function domKids(el) {
+  const out = [];
+  for (const c of el.children) if (domShown(c)) out.push(c);
+  return out;
+}
+function domVisible(el) {
+  try {
+    return el.checkVisibility ? el.checkVisibility({ visibilityProperty: true, opacityProperty: true }) : el.getClientRects().length > 0;
+  } catch { return true; }
+}
+function domName(el) {
+  if (el === domPage()) return "Page (HTML)";
+  const m = metaOf(el);
+  if (m && m.name) return m.name;
+  if (el.id) return `#${el.id}`;
+  const cls = (el.getAttribute("class") || "").trim().split(/\s+/)[0];
+  if (cls) return `.${cls}`;
+  const t = el.childElementCount ? "" : (el.textContent || "").trim();
+  if (t) return `"${t.length > 22 ? t.slice(0, 21) + "…" : t}"`;
+  return el.tagName.toLowerCase();
+}
+/** The element's box in overlay coordinates. */
+function domRect(el) {
+  const b = el.getBoundingClientRect(); // relative to the iframe, like canvasRect()
+  if (!b.width && !b.height) return null;
+  const v = state.view;
+  return { x: v.x + b.left * v.z, y: v.y + b.top * v.z, w: b.width * v.z, h: b.height * v.z };
+}
+/** The listed HTML element under an overlay point, when it is drawn above the game's canvas. */
+function pickDom(pt) {
+  const doc = state.win && state.win.document;
+  if (!doc) return null;
+  const v = state.view;
+  let el;
+  try { el = doc.elementFromPoint((pt.x - v.x) / v.z, (pt.y - v.y) / v.z); } catch { return null; }
+  for (; el && el !== doc.body && el !== doc.documentElement; el = el.parentElement) {
+    if (isGameCanvas(el)) return null;
+    const host = domHostOf(el);
+    if (host) return host; // the DOMContainer (a Pixi object), not its element
+    if (domShown(el)) return el;
+  }
+  return null;
+}
+/** Hides an element while editing (not saved), or shows it again. */
+function toggleDomHidden(el) {
+  if (domHidden.has(el)) { el.style.visibility = domHidden.get(el); domHidden.delete(el); }
+  else { domHidden.set(el, el.style.visibility); el.style.visibility = "hidden"; }
+}
+
+// ---------------------------------------------------------------- moving and resizing HTML
+// Loose HTML is placed by CSS, so dragging it changes CSS: left/top (or right/bottom, whichever
+// holds the element) and width/height, each in the unit the code uses (px, %, vw, vh, em, rem).
+const LEN_RE = /^(-?\d*\.?\d+)(px|%|vw|vh|vmin|vmax|em|rem)?$/i;
+const isSetLength = (v) => v !== "" && v !== "auto";
+/**
+ * Where a CSS property of an element is changed: its inline style when it has the property, else
+ * the CSS rule that sets it (the one that wins), else inline when the element is linked to code,
+ * else its most specific rule linked to a file.
+ */
+function styleTargetFor(el, prop) {
+  if (el.style.getPropertyValue(prop) !== "") return el;
+  let rules = [];
+  try { rules = matchedRules(el); } catch { /* */ }
+  const sets = rules.find((x) => x.rule.style.getPropertyValue(prop) !== "");
+  if (sets) return sets.rule;
+  const m = metaOf(el);
+  if (m && m.declId) return el;
+  const linked = rules.find((x) => (metaOf(x.rule) || {}).declId);
+  return linked ? linked.rule : el;
+}
+/** How an element is laid out: can it be moved, which edges hold it, and (if not) what places it. */
+function domLayout(el) {
+  const win = state.win, cs = win.getComputedStyle(el);
+  const pos = cs.position;
+  const css = (p) => String(propDef(`css:${p}`).get(styleTargetFor(el, p))).trim();
+  const movable = pos === "absolute" || pos === "fixed" || pos === "relative";
+  // When it can't move, say what holds it in place: its parent's flex/grid layout, or normal flow.
+  let container = null;
+  if (!movable) {
+    const parent = el.parentElement;
+    const pd = parent ? win.getComputedStyle(parent).display : "";
+    container = /flex/.test(pd) ? "flex" : /grid/.test(pd) ? "grid" : "normal flow";
+  }
+  return {
+    pos, movable, container,
+    xProp: !isSetLength(css("left")) && isSetLength(css("right")) ? "right" : "left",
+    yProp: !isSetLength(css("top")) && isSetLength(css("bottom")) ? "bottom" : "top",
+  };
+}
+/** Size of the box that %-lengths refer to. */
+function containingSize(el, pos) {
+  const win = state.win, doc = win.document;
+  const viewport = { w: doc.documentElement.clientWidth || win.innerWidth, h: doc.documentElement.clientHeight || win.innerHeight };
+  if (pos === "fixed") return viewport;
+  if (pos === "absolute") {
+    const op = el.offsetParent;
+    if (!op || (op === doc.body && win.getComputedStyle(op).position === "static")) return viewport;
+    return { w: op.clientWidth, h: op.clientHeight }; // its padding box
+  }
+  const p = el.parentElement; // static/relative: the parent's content box
+  if (!p) return viewport;
+  const pcs = win.getComputedStyle(p);
+  return {
+    w: p.clientWidth - parseFloat(pcs.paddingLeft) - parseFloat(pcs.paddingRight),
+    h: p.clientHeight - parseFloat(pcs.paddingTop) - parseFloat(pcs.paddingBottom),
+  };
+}
+/** CSS pixels in one unit, for a horizontal (x) or vertical length. */
+function pxPerUnit(unit, el, axis, pos) {
+  const win = state.win;
+  switch (unit) {
+    case "%": { const cb = containingSize(el, pos); return (axis === "x" ? cb.w : cb.h) / 100; }
+    case "vw": return win.innerWidth / 100;
+    case "vh": return win.innerHeight / 100;
+    case "vmin": return Math.min(win.innerWidth, win.innerHeight) / 100;
+    case "vmax": return Math.max(win.innerWidth, win.innerHeight) / 100;
+    case "em": return parseFloat(win.getComputedStyle(el).fontSize) || 16;
+    case "rem": return parseFloat(win.getComputedStyle(win.document.documentElement).fontSize) || 16;
+    default: return 1;
+  }
+}
+/**
+ * Where a length starts from when dragging: its value as written, or, when it isn't set (auto),
+ * what the browser computes, in px. Null when it is an expression (calc(), var()…).
+ */
+function lengthBase(el, prop, target = el) {
+  let raw = String(propDef(`css:${prop}`).get(target)).trim();
+  if (!isSetLength(raw)) raw = state.win.getComputedStyle(el)[prop];
+  const m = LEN_RE.exec(raw);
+  if (!m) return null;
+  return { n: parseFloat(m[1]), unit: (m[2] || "px").toLowerCase() };
+}
+/** The length moved by `dpx` CSS pixels, in its own unit. */
+function shiftedLength(base, dpx, el, axis, pos) {
+  const v = base.n + dpx / pxPerUnit(base.unit, el, axis, pos);
+  const dec = base.unit === "px" ? 0 : 2;
+  return `${Number(v.toFixed(dec))}${base.unit}`;
+}
+
+/**
+ * Starts dragging an HTML element: "move" (left/top…) or "size" from a corner handle ("nw", "se"…).
+ * Elements in the normal flow (position: static) can't be moved, only resized.
+ */
+function domDragStart(el, pt, mode, handle = null, clickPick = null) {
+  const L = domLayout(el);
+  const d = { type: "dom", el, startPt: pt, moved: false, axis: null, mode, handle, L, clickPick, bases: {}, deltas: [] };
+  const want = (prop, axis, sign) => { d.deltas.push({ prop, axis, sign }); };
+  if (mode === "move") {
+    if (!L.movable) { d.mode = "blocked"; }
+    else {
+      want(L.xProp, "x", L.xProp === "right" ? -1 : 1);
+      want(L.yProp, "y", L.yProp === "bottom" ? -1 : 1);
+    }
+  } else {
+    const west = handle.includes("w"), north = handle.includes("n");
+    want("width", "x", west ? -1 : 1);
+    want("height", "y", north ? -1 : 1);
+    // Keep the opposite edge in place: a west handle moves `left`, an east one moves `right`.
+    if (L.movable && west && L.xProp === "left") want("left", "x", 1);
+    if (L.movable && !west && L.xProp === "right") want("right", "x", -1);
+    if (L.movable && north && L.yProp === "top") want("top", "y", 1);
+    if (L.movable && !north && L.yProp === "bottom") want("bottom", "y", -1);
+  }
+  const computed = [];
+  d.targetOf = {};
+  d.deltas = d.deltas.filter((x) => {
+    const t = (d.targetOf[x.prop] = styleTargetFor(el, x.prop));
+    const b = lengthBase(el, x.prop, t);
+    if (!b) { computed.push(x.prop); return false; }
+    d.bases[x.prop] = b;
+    return true;
+  });
+  d.computed = computed; // set with calc()/var(): left alone
+  // each property is changed where it is set (inline or a CSS rule): one undo step per place
+  d.targets = new Map();
+  for (const x of d.deltas) {
+    x.target = d.targetOf[x.prop];
+    if (!d.targets.has(x.target)) d.targets.set(x.target, []);
+    d.targets.get(x.target).push(`css:${x.prop}`);
+  }
+  d.before = new Map([...d.targets].map(([t, props]) => [t, readVals(t, props)]));
+  const shared = [...d.targets.keys()].filter(isCssRule);
+  if (shared.length) {
+    let n = 0;
+    try { n = Math.max(...shared.map((r) => state.win.document.querySelectorAll(r.selectorText).length)); } catch { /* */ }
+    d.note = `Changing the CSS rule ${shared.map((r) => r.selectorText).join(", ")}${n > 1 ? ` (it applies to ${n} elements)` : ""}`;
+  }
+  return d;
+}
+/** Applies a drag of (dx, dy) overlay pixels. */
+function domDragMove(d, dx, dy, shift) {
+  if (d.mode === "blocked") {
+    setStatus(`${nameOf(d.el)} is placed by its parent (position: ${d.L.pos}): resize it from its corner, or set position: absolute in its Style to move it.`, "err");
+    return;
+  }
+  if (d.mode === "move" && shift) { d.axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y"; } else d.axis = null;
+  if (d.axis === "x") dy = 0;
+  if (d.axis === "y") dx = 0;
+  const z = state.view.z;
+  const vals = {};
+  const isSize = (p) => p === "width" || p === "height";
+  for (const x of d.deltas) {
+    if (d.mode === "size" && !isSize(x.prop)) continue; // edges follow the size, below
+    let dpx = ((x.axis === "x" ? dx : dy) / z) * x.sign;
+    if (isSize(x.prop)) {
+      const startPx = d.bases[x.prop].n * pxPerUnit(d.bases[x.prop].unit, d.el, x.axis, d.L.pos);
+      if (startPx + dpx < 0) dpx = -startPx; // never below 0
+    }
+    vals[`css:${x.prop}`] = shiftedLength(d.bases[x.prop], dpx, d.el, x.axis, d.L.pos);
+  }
+  if (d.mode === "size") {
+    // Keep the opposite edge in place: the held edge (left/right, top/bottom) moves back by what the size grew.
+    for (const x of d.deltas) {
+      if (isSize(x.prop)) continue;
+      const sb = d.bases[x.axis === "x" ? "width" : "height"];
+      const nv = vals[`css:${x.axis === "x" ? "width" : "height"}`];
+      if (!sb || !nv) continue;
+      const grown = (parseFloat(nv) - sb.n) * pxPerUnit(sb.unit, d.el, x.axis, d.L.pos);
+      vals[`css:${x.prop}`] = shiftedLength(d.bases[x.prop], -grown, d.el, x.axis, d.L.pos);
+    }
+  }
+  // A length that wasn't set and doesn't change is not written (auto stays auto).
+  for (const k of Object.keys(vals)) {
+    const prop = k.slice(4), b = d.bases[prop], t = d.targetOf[prop];
+    if (d.before.get(t)[k] === "" && b && Math.abs(parseFloat(vals[k]) - b.n) < 1e-9) vals[k] = "";
+  }
+  for (const [t, props] of d.targets) {
+    const part = {};
+    for (const k of props) if (k in vals) part[k] = vals[k];
+    setLive(t, part);
+  }
+  refreshDomValues();
+  if (d.note) setStatus(d.note);
+  if (d.computed.length) setStatus(`${d.computed.join(", ")} ${d.computed.length > 1 ? "are" : "is"} computed in the code (calc, var…), so ${d.computed.length > 1 ? "they stay" : "it stays"} as is.`, "err");
+}
+/** Ends an HTML drag: one undo step and pending changes, like any object. */
+function domDragEnd(d) {
+  if (d.mode === "blocked") return;
+  for (const [t, before] of d.before) commit(t, before, readVals(t, Object.keys(before)));
+  renderInspector(); // new rows (left, width…) may have appeared
+}
+/** Corner handles for the selected HTML element: all four when it can move, only SE otherwise. */
+function domHandles(r, movable) {
+  const se = { id: "se", x: r.x + r.w, y: r.y + r.h, cursor: "nwse-resize" };
+  if (!movable) return r.w > 0 && r.h > 0 ? [se] : []; // it can't be dragged anyway: always resizable
+  if (r.w < 24 || r.h < 24) return []; // small: the corners would cover it and block moving it
+  const all = [
+    { id: "nw", x: r.x, y: r.y, cursor: "nwse-resize" },
+    { id: "ne", x: r.x + r.w, y: r.y, cursor: "nesw-resize" },
+    { id: "sw", x: r.x, y: r.y + r.h, cursor: "nesw-resize" },
+    se,
+  ];
+  return all;
 }
 
 // ---------------------------------------------------------------- hierarchy
@@ -1389,6 +1809,16 @@ function treeFilter() {
     }
   })(state.app.stage);
   keep.add(state.app.stage);
+  const page = domPage();
+  if (page) (function walkDom(el) {
+    for (const c of domKids(el)) {
+      if (nameOf(c).toLowerCase().includes(q) || c.tagName.toLowerCase() === q) {
+        matches.push(c);
+        for (let p = c; p && !keep.has(p); p = p.parentElement) keep.add(p);
+      }
+      walkDom(c);
+    }
+  })(page);
   return { q, matches, keep };
 }
 
@@ -1400,11 +1830,17 @@ function treeSignature() {
     if (state.treeQuery) { for (const c of o.children) walk(c); return; } // search: the whole scene
     if (state.expanded.has(o)) for (const c of o.children.slice(0, MAX_CHILDREN)) walk(c);
   })(state.app.stage);
+  const page = domPage();
+  if (page) (function walkDom(el) {
+    const kids = domKids(el);
+    parts.push(`h${uid(el)}`, kids.length, domVisible(el) ? 1 : 0, domHidden.has(el) ? 1 : 0, isModified(el) ? 1 : 0, nameOf(el));
+    if (state.treeQuery || state.expanded.has(el)) for (const c of kids.slice(0, MAX_CHILDREN)) walkDom(c);
+  })(page);
   return parts.join(",");
 }
 function paintTreeSelection(scrollToSel = false) {
   for (const row of treeEl.querySelectorAll(".node")) {
-    const on = row._obj === state.selected;
+    const on = row._obj === (state.selected || state.domSelected);
     row.classList.toggle("selected", on);
     if (on && scrollToSel) row.scrollIntoView({ block: "nearest" });
   }
@@ -1412,6 +1848,7 @@ function paintTreeSelection(scrollToSel = false) {
 function renderTree(scrollToSel = false) {
   if (!state.app) { treeEl.innerHTML = ""; return; }
   if (treeEl.querySelector("input.rename") || state.dragNode) return;
+  if (state.domSelected && !state.domSelected.isConnected) select(null); // the game removed it
   const sig = treeSignature();
   if (sig === state.treeSig) { paintTreeSelection(scrollToSel); return; }
   state.treeSig = sig;
@@ -1543,6 +1980,68 @@ function renderTree(scrollToSel = false) {
       }
     }
   })(state.app.stage, 0);
+  // The page's HTML elements, after the Pixi scene (read-only).
+  const page = domPage();
+  if (page && domKids(page).length && (!filter || filter.keep.has(page))) (function addDom(el, depth) {
+    if (filter && !filter.keep.has(el)) return;
+    const kids = domKids(el);
+    const row = document.createElement("div");
+    row.className = "node dom" + (el === page ? " dom-root" : "") + (el === state.domSelected ? " selected" : "") + (domVisible(el) ? "" : " hidden");
+    row.style.paddingLeft = `${6 + depth * 14}px`;
+    row._obj = el;
+    const has = kids.length > 0;
+    const open = filter ? kids.some((c) => filter.keep.has(c)) : state.expanded.has(el);
+    if (filter && el !== page && !filter.matches.includes(el)) row.classList.add("match-off");
+    const caret = document.createElement("span");
+    caret.className = "caret" + (has ? " has" : "");
+    caret.textContent = has ? (open ? "▼" : "▶") : "";
+    caret.onclick = (ev) => {
+      ev.stopPropagation();
+      if (filter) return;
+      open ? state.expanded.delete(el) : state.expanded.add(el);
+      state.treeSig = ""; renderTree();
+    };
+    const dot = document.createElement("span");
+    dot.className = "dot" + (isEditable(el) ? " editable" : "");
+    dot.title = isEditable(el) ? "Linked to code" : "Not linked to any code line";
+    const name = document.createElement("span");
+    name.className = "name";
+    const n = nameOf(el), i = filter ? n.toLowerCase().indexOf(filter.q) : -1;
+    if (i >= 0) {
+      const mark = document.createElement("mark");
+      mark.textContent = n.slice(i, i + filter.q.length);
+      name.append(n.slice(0, i), mark, n.slice(i + filter.q.length));
+    } else name.textContent = n;
+    if (isModified(el)) { const mod = document.createElement("span"); mod.className = "mod"; mod.textContent = " •"; name.appendChild(mod); }
+    const type = document.createElement("span");
+    type.className = "type";
+    type.textContent = typeOf(el) + (has ? ` · ${kids.length}` : "");
+    row.append(caret, dot, name, type);
+    if (el !== page) {
+      const eye = document.createElement("span");
+      const off = domHidden.has(el);
+      eye.className = "eye" + (off ? " off" : "");
+      eye.title = off ? "Show" : "Hide while editing (not saved)";
+      eye.textContent = off ? "○" : "◉";
+      eye.onclick = (ev) => { ev.stopPropagation(); toggleDomHidden(el); state.treeSig = ""; renderTree(); };
+      row.append(eye);
+    }
+    row.title = "HTML element of the page";
+    row.onclick = () => select(el === page ? null : el);
+    frag.appendChild(row);
+    if (el === state.domSelected) selEl = row;
+    if (has && open) {
+      const list = filter ? kids.filter((c) => filter.keep.has(c)) : kids;
+      for (const c of list.slice(0, MAX_CHILDREN)) addDom(c, depth + 1);
+      if (list.length > MAX_CHILDREN) {
+        const more = document.createElement("div");
+        more.className = "node more";
+        more.style.paddingLeft = `${6 + (depth + 1) * 14 + 18}px`;
+        more.textContent = `… ${list.length - MAX_CHILDREN} more`;
+        frag.appendChild(more);
+      }
+    }
+  })(page, 0);
   const scroll = treeEl.scrollTop;
   treeEl.replaceChildren(frag);
   treeEl.scrollTop = scroll;
@@ -1723,7 +2222,7 @@ function renderAppearance(o) {
   const m = metaOf(o);
   if (isSprite(o)) sec.appendChild(textureRow(o));
   if (isSpine(o)) { sec.appendChild(spineRow(o)); sec.appendChild(animationRow(o)); }
-  if (typeof o.tint === "number") sec.appendChild(colorRow(o, "tint", "Tint"));
+  if (typeof o.tint === "number" && !domElementOf(o)) sec.appendChild(colorRow(o, "tint", "Tint")); // tint doesn't apply to HTML
   if ("text" in o && (typeof o.text === "string" || typeof o.text === "number")) sec.appendChild(textRow(o));
   if (o.style && colorToNumber(o.style.fill) != null) sec.appendChild(colorRow(o, "textFill", "Text color"));
   if (isTextLike(o)) for (const row of textStyleRows(o)) sec.appendChild(row);
@@ -1782,6 +2281,7 @@ function textRow(o) {
 function renderInspector() {
   const o = state.selected;
   if (state.previewCleanup) { state.previewCleanup(); state.previewCleanup = null; }
+  if (state.domSelected) { renderDomInspector(state.domSelected); return; }
   if (!o && state.fileView) { renderFileView(state.fileView); return; }
   if (!o) { inspectorEl.innerHTML = `<p class="empty">Select an object in the scene or in the hierarchy.</p>`; return; }
   inspectorEl.innerHTML = "";
@@ -1818,7 +2318,10 @@ function renderInspector() {
   sec.appendChild(pivotPresets(o));
   inspectorEl.appendChild(sec);
 
-  inspectorEl.appendChild(renderAppearance(o));
+  const appearance = renderAppearance(o);
+  if (appearance.children.length > 1) inspectorEl.appendChild(appearance); // more than its title
+  const hostEl = domElementOf(o);
+  if (hostEl) domSections(hostEl, { host: o }); // DOMContainer: its HTML element
   inspectorEl.appendChild(renderComponents(o));
 
   // Linked code
@@ -1874,6 +2377,710 @@ function renderInspector() {
   }
   refreshInspectorValues(true);
 }
+
+// ---------------------------------------------------------------- HTML element inspector
+// Element properties offered for each tag; any other property shows up when the code sets it.
+const DOM_ATTRS = {
+  INPUT: ["placeholder", "value", "type", "maxLength"],
+  TEXTAREA: ["placeholder", "value", "maxLength"],
+  BUTTON: ["type"],
+  IMG: ["src", "alt"],
+  A: ["href"],
+};
+const DOM_ATTR_LABEL = { textContent: "Text", innerText: "Text", maxLength: "Max length", className: "Class", htmlFor: "For", id: "Id" };
+const NO_TEXT_TAGS = new Set(["INPUT", "IMG", "TEXTAREA", "SELECT", "BR", "HR", "VIDEO", "AUDIO", "CANVAS", "IFRAME"]);
+const CSS_SUGGEST = [
+  // text
+  "color", "font-size", "font-family", "font-weight", "font-style", "line-height", "letter-spacing",
+  "text-align", "text-transform", "text-decoration", "white-space",
+  // background & border
+  "background", "background-color", "background-image", "background-size", "background-position",
+  "border", "border-width", "border-style", "border-color", "border-radius", "box-shadow", "outline",
+  // box: size
+  "width", "height", "min-width", "max-width", "min-height", "max-height", "box-sizing",
+  // box: padding (shorthand + sides)
+  "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
+  // box: margin (shorthand + sides)
+  "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+  // layout
+  "display", "position", "top", "right", "bottom", "left", "inset", "z-index", "overflow", "overflow-x", "overflow-y",
+  // flex / grid
+  "flex", "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
+  "justify-content", "align-items", "align-self", "gap", "row-gap", "column-gap", "order",
+  "grid-template-columns", "grid-template-rows",
+  // effects & misc
+  "opacity", "visibility", "transform", "transform-origin", "transition", "cursor", "pointer-events",
+  "object-fit", "aspect-ratio",
+];
+// How to write each property's value, shown as the field's placeholder (and the label's tooltip) so
+// you know the expected format of a property you just added.
+const CSS_HINT = {
+  color: "e.g. #fff, rgb(…), hsl(…)",
+  background: "e.g. #222, linear-gradient(…), url(…)",
+  "background-color": "e.g. #222",
+  "background-image": "e.g. url(…), linear-gradient(…)",
+  "background-size": "cover | contain | e.g. 100% auto",
+  "background-position": "center | e.g. 0 0, 50% 50%",
+  "font-size": "e.g. 16px, 1.2rem, clamp(…)",
+  "font-family": "e.g. Inter, system-ui, sans-serif",
+  "font-weight": "400 | 700 | bold | lighter",
+  "font-style": "normal | italic",
+  "line-height": "e.g. 1.4, 24px",
+  "letter-spacing": "e.g. 0.02em, 1px",
+  "text-align": "left | center | right | justify",
+  "text-transform": "none | uppercase | capitalize",
+  "text-decoration": "none | underline",
+  "white-space": "normal | nowrap | pre",
+  border: "e.g. 1px solid #444",
+  "border-width": "e.g. 1px",
+  "border-style": "solid | dashed | dotted | none",
+  "border-color": "e.g. #444",
+  "border-radius": "e.g. 6px, 50%",
+  "box-shadow": "e.g. 0 2px 8px rgba(0,0,0,.3)",
+  outline: "e.g. 1px solid #5eead4",
+  width: "e.g. 120px, 50%, auto",
+  height: "e.g. 40px, 100%, auto",
+  "min-width": "e.g. 0, 120px",
+  "max-width": "e.g. 480px, 100%, none",
+  "min-height": "e.g. 0, 40px",
+  "max-height": "e.g. 480px, none",
+  "box-sizing": "border-box | content-box",
+  padding: "e.g. 8px or 8px 16px",
+  margin: "e.g. 8px or 0 auto",
+  display: "flex | grid | block | inline-block | none",
+  position: "static | relative | absolute | fixed | sticky",
+  top: "e.g. 0, 12px, 50%",
+  right: "e.g. 0, 12px",
+  bottom: "e.g. 0, 12px",
+  left: "e.g. 0, 12px, 50%",
+  inset: "e.g. 0, 8px 12px",
+  "z-index": "e.g. 10, 100",
+  overflow: "visible | hidden | auto | scroll",
+  "overflow-x": "visible | hidden | auto | scroll",
+  "overflow-y": "visible | hidden | auto | scroll",
+  flex: "e.g. 1, 0 0 auto",
+  "flex-direction": "row | column | row-reverse",
+  "flex-wrap": "nowrap | wrap",
+  "flex-grow": "e.g. 0, 1",
+  "flex-shrink": "e.g. 0, 1",
+  "flex-basis": "auto | e.g. 120px",
+  "justify-content": "flex-start | center | space-between | …",
+  "align-items": "stretch | center | flex-start | …",
+  "align-self": "auto | center | stretch | …",
+  gap: "e.g. 8px or 8px 16px",
+  "row-gap": "e.g. 8px",
+  "column-gap": "e.g. 8px",
+  order: "e.g. 0, 1, -1",
+  "grid-template-columns": "e.g. 1fr 1fr, repeat(3, 1fr)",
+  "grid-template-rows": "e.g. auto 1fr",
+  opacity: "0–1, e.g. 0.5",
+  visibility: "visible | hidden",
+  transform: "e.g. translate(…), scale(…), rotate(…)",
+  "transform-origin": "center | e.g. 0 0",
+  transition: "e.g. all .2s ease",
+  cursor: "pointer | default | grab | not-allowed | …",
+  "pointer-events": "auto | none",
+  "object-fit": "contain | cover | fill | none",
+  "aspect-ratio": "e.g. 1, 16 / 9",
+};
+/** The format hint for a CSS property name (a side/variant falls back to its family's hint). */
+function cssHint(name) {
+  if (CSS_HINT[name]) return CSS_HINT[name];
+  if (/^(padding|margin|inset)-(top|right|bottom|left)$/.test(name)) return "e.g. 8px, 1rem";
+  if (/^border(-(top|right|bottom|left))?-width$/.test(name)) return "e.g. 1px";
+  if (/^border(-(top|right|bottom|left))?-style$/.test(name)) return "solid | dashed | dotted | none";
+  if (/^border(-(top|right|bottom|left))?-color$/.test(name)) return "e.g. #444";
+  if (/^border-(top|right|bottom|left)$/.test(name)) return "e.g. 1px solid #444";
+  if (/radius$/.test(name)) return "e.g. 6px";
+  if (name.startsWith("--")) return "a value, e.g. 8px or #fff";
+  if (/color$/.test(name)) return "e.g. #fff";
+  return null;
+}
+const COLOR_CSS = /(^|-)color$|^background$|^fill$|^stroke$/;
+// Shorthands the browser expands into longhands (el.style lists `padding-top`… for `padding`).
+const CSS_SHORTHANDS = [
+  ["margin", /^margin-(top|right|bottom|left)$/],
+  ["padding", /^padding-(top|right|bottom|left)$/],
+  ["border", /^border-(top|right|bottom|left)-(width|style|color)$|^border-(width|style|color)$|^border-image-/],
+  ["border-width", /^border-(top|right|bottom|left)-width$/],
+  ["border-style", /^border-(top|right|bottom|left)-style$/],
+  ["border-color", /^border-(top|right|bottom|left)-color$/],
+  ["border-radius", /^border-(top|bottom)-(left|right)-radius$/],
+  ["background", /^background-/],
+  ["font", /^font-|^line-height$/],
+  ["flex", /^flex-(grow|shrink|basis)$/],
+  ["gap", /^(row|column)-gap$/],
+  ["outline", /^outline-/],
+  ["overflow", /^overflow-[xy]$/],
+  ["text-decoration", /^text-decoration-/],
+  ["transition", /^transition-/],
+  ["animation", /^animation-/],
+  ["list-style", /^list-style-/],
+];
+const domExtra = new WeakMap(); // element -> CSS properties added in the inspector (shown even while empty)
+
+// The browser normalizes what it stores (#ff0000 -> rgb(255, 0, 0)): remember what was typed, so that
+// is what the inspector shows and what gets saved, as long as the element still has that value.
+const cssTyped = new WeakMap(); // element -> { prop: { raw, stored } }
+function cssProp(name) {
+  return {
+    get: (el) => {
+      const v = el.style.getPropertyValue(name);
+      const t = cssTyped.get(el) && cssTyped.get(el)[name];
+      return t && t.stored === v ? t.raw : v;
+    },
+    set: (el, v) => {
+      if (v == null || v === "") el.style.removeProperty(name);
+      else el.style.setProperty(name, String(v), el.style.getPropertyPriority(name));
+      if (!cssTyped.has(el)) cssTyped.set(el, {});
+      cssTyped.get(el)[name] = { raw: v == null ? "" : String(v), stored: el.style.getPropertyValue(name) };
+    },
+  };
+}
+function attrProp(name) {
+  return {
+    get: (el) => { const v = el[name]; return v == null ? "" : v; },
+    set: (el, v) => { el[name] = v; },
+  };
+}
+/** The inline style properties to list: the code's lines first, then what the element has. */
+// Written by Pixi on a DOMContainer's element every frame (position, transform, alpha): not the code's.
+const PIXI_DOM_STYLE = new Set(["position", "pointer-events", "transform", "transform-origin", "opacity"]);
+function cssListOf(el) {
+  const m = metaOf(el);
+  if (isCssRule(el)) {
+    // a rule: its declarations as written, then what was added in the inspector
+    const out = [];
+    const push = (p) => { if (p && !out.includes(p)) out.push(p); };
+    if (m && m.props) m.props.forEach(push);
+    else for (let i = 0; i < el.style.length; i++) push(el.style[i]);
+    for (const rec of state.pending.values()) if (rec.obj === el && rec.prop.startsWith("css:")) push(rec.prop.slice(4));
+    for (const p of domExtra.get(el) || []) push(p);
+    return out;
+  }
+  const out = [];
+  const pixiOwned = domHostOf(el) ? PIXI_DOM_STYLE : null;
+  const push = (p) => { if (p && !out.includes(p)) out.push(p); };
+  for (const k of Object.keys((m && m.sites) || {})) if (k.startsWith("css:")) push(k.slice(4));
+  for (let i = 0; i < el.style.length; i++) {
+    const p = el.style[i];
+    if (domHidden.has(el) && p === "visibility") continue; // the editor's own hiding
+    if (pixiOwned && pixiOwned.has(p) && !(m && m.sites[`css:${p}`])) continue;
+    const sh = CSS_SHORTHANDS.find(([name, re]) => re.test(p) && el.style.getPropertyValue(name) !== "");
+    push(sh ? sh[0] : p);
+  }
+  for (const rec of state.pending.values()) if (rec.obj === el && rec.prop.startsWith("css:")) push(rec.prop.slice(4));
+  for (const p of domExtra.get(el) || []) push(p);
+  // A longhand that is part of a listed shorthand is already shown by it.
+  return out.filter((p) => !out.some((q) => q !== p && CSS_SHORTHANDS.some(([name, re]) => name === q && re.test(p)) && !(m && m.sites[`css:${p}`])));
+}
+/** What saving a property will do (shown as the row's tooltip). */
+function domSaveNote(el, prop) {
+  const m = metaOf(el);
+  const site = m && m.sites[prop];
+  if (isCssRule(el)) return !m || !m.declId ? "This rule is not linked to a CSS file: the change can't be saved" : site ? `Saved in ${m.file}` : `Saving adds it to this rule in ${m.file}`;
+  if (site && site.html) return "Saved in index.html";
+  if (site && site.tpl) return "Saved in the template that writes this element";
+  if (site) return "Saved on the line that sets it";
+  if (m && m.html) return "Saving adds it in index.html";
+  if (m && m.tpl) return "Saving adds it to the element's tag in its template";
+  if (domHostOf(el)) return "Saving adds a line right after the DOMContainer is created";
+  if (m && m.declId) return "Saving adds a line right after the element is created";
+  return "This element is not linked to code: the change can't be saved";
+}
+/** One editable HTML property (an inline style or an element property). */
+function domRow(el, prop, labelText, { multiline = false } = {}) {
+  const row = document.createElement("div");
+  row.className = "row single dom-row";
+  const color = prop.startsWith("css:") && COLOR_CSS.test(prop.slice(4));
+  row.innerHTML = `<label></label><div class="field${color ? " color-field" : ""}">${color ? '<input type="color">' : ""}${multiline ? '<textarea rows="2" spellcheck="false"></textarea>' : '<input type="text" spellcheck="false">'}</div>`;
+  const label = row.querySelector("label");
+  label.innerHTML = `<span class="t"></span>`;
+  label.firstChild.textContent = labelText;
+  const hint = prop.startsWith("css:") ? cssHint(prop.slice(4)) : null;
+  label.title = hint ? `${hint}\n${domSaveNote(el, prop)}` : domSaveNote(el, prop);
+  const m = metaOf(el);
+  label.classList.toggle("linked", !!(m && m.sites[prop]));
+  const input = row.querySelector(multiline ? "textarea" : 'input[type="text"]');
+  if (hint) input.placeholder = hint; // shows the expected format while the field is empty
+  input.dataset.dprop = prop;
+  input._target = el; // the element, or a CSS rule
+  const picker = row.querySelector('input[type="color"]');
+  // Keep the property's type: maxLength stays a number, disabled a boolean.
+  const parse = (text) => {
+    const cur = propDef(prop).get(el);
+    if (typeof cur === "number") return text.trim() === "" || isNaN(Number(text)) ? cur : Number(text);
+    if (typeof cur === "boolean") return text.trim() === "true";
+    return text;
+  };
+  let before = null;
+  const begin = () => { if (!before) before = readVals(el, [prop]); };
+  const finish = () => {
+    if (!before) return;
+    commit(el, before, readVals(el, [prop]));
+    before = null;
+    refreshDomValues();
+  };
+  input.addEventListener("focus", begin);
+  input.addEventListener("input", () => { begin(); setLive(el, { [prop]: parse(input.value) }); });
+  input.addEventListener("change", finish);
+  input.addEventListener("blur", finish);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !(multiline && e.shiftKey)) { e.preventDefault(); input.blur(); return; }
+    if (e.key === "Escape") { if (before) { setLive(el, before); before = null; } refreshDomValues(true); input.blur(); return; }
+    // Arrow keys change the number and keep the unit: 1.5em -> 1.6em (Shift ×10, Alt ×0.1)
+    if (!multiline && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      const n = /^(-?\d*\.?\d+)([a-z%]*)$/i.exec(input.value.trim());
+      if (!n) return;
+      e.preventDefault();
+      begin();
+      const unitStep = n[2] === "" || n[2] === "px" || n[2] === "%" ? 1 : 0.1;
+      const step = (e.shiftKey ? 10 : e.altKey ? 0.1 : 1) * unitStep * (e.key === "ArrowUp" ? 1 : -1);
+      input.value = `${Number((Number(n[1]) + step).toFixed(3))}${n[2]}`;
+      setLive(el, { [prop]: parse(input.value) });
+    }
+  });
+  if (picker) {
+    picker.addEventListener("input", () => { begin(); input.value = picker.value; setLive(el, { [prop]: picker.value }); });
+    picker.addEventListener("change", finish);
+  }
+  return row;
+}
+/**
+ * Shows each style as the code writes it: the browser normalizes what it stores (#fff ->
+ * rgb(255, 255, 255), `border: none` -> no shorthand value), so when the code's literal gives the
+ * same stored value, the field shows the literal.
+ */
+function adoptCodeLiterals(el) {
+  const m = metaOf(el);
+  if (!m) return;
+  const rows = Object.entries(m.sites).filter(([k, st]) => k.startsWith("css:") && !st.html);
+  const ids = rows.map(([, st]) => st.id);
+  if (!ids.length) return;
+  loadInfo(ids).then(() => {
+    const probe = document.createElement("div");
+    let changed = false;
+    for (const [k, st] of rows) {
+      const name = k.slice(4);
+      const inf = state.info.get(st.id);
+      const lit = inf && /^(["'`])(.*)\1$/s.exec((inf.arg || "").trim());
+      if (!lit || lit[1] === "`" && lit[2].includes("${")) continue;
+      const raw = lit[2];
+      if (!cssTyped.has(el)) cssTyped.set(el, {});
+      const typed = cssTyped.get(el);
+      if (typed[name]) continue; // edited in the inspector: that text wins
+      probe.style.cssText = "";
+      probe.style.setProperty(name, raw);
+      const stored = el.style.getPropertyValue(name);
+      if (probe.style.getPropertyValue(name) === stored) { typed[name] = { raw, stored }; changed = true; }
+    }
+    if (changed) refreshDomValues(true);
+  });
+}
+/** Updates the HTML inspector's fields from the element (after undo, a save…). */
+function refreshDomValues(force = false) {
+  const el = state.domSelected || domElementOf(state.selected);
+  if (!el) return;
+  for (const input of inspectorEl.querySelectorAll("[data-dprop]")) {
+    const prop = input.dataset.dprop;
+    const target = input._target || el;
+    const field = input.closest(".field");
+    field.classList.toggle("changed", state.pending.has(`${uid(target)}:${prop}`));
+    if (!force && document.activeElement === input) continue;
+    const txt = String(propDef(prop).get(target));
+    if (input.value !== txt) input.value = txt;
+    const picker = field.querySelector('input[type="color"]');
+    if (picker) { const n = txt ? colorToNumber(txt) : null; if (n != null) picker.value = toHex(n); }
+  }
+}
+
+/** An inspector section with a title, appended to the inspector. */
+function inspectorSection(title) {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML = `<h4></h4>`;
+  sec.querySelector("h4").textContent = title;
+  inspectorEl.appendChild(sec);
+  return sec;
+}
+/** A read-only "label: value" line. */
+function kvRow(sec, label, value) {
+  if (value == null || value === "") return;
+  const row = document.createElement("div");
+  row.className = "kv";
+  row.innerHTML = `<span class="k"></span><span class="v"></span>`;
+  row.querySelector(".k").textContent = label;
+  row.querySelector(".v").textContent = row.querySelector(".v").title = String(value);
+  sec.appendChild(row);
+}
+
+/**
+ * Note shown when an element can't be dragged because its parent lays it out (flex/grid/normal
+ * flow). Offers to add `position: relative`, which keeps its slot in the layout but lets left/top
+ * (and so dragging) offset it.
+ */
+function movabilityNote(sec, el, L) {
+  const note = document.createElement("p");
+  note.className = "note warn";
+  note.textContent = `Placed by its parent (${L.container}): dragging only resizes it. Make it movable to drag its position.`;
+  sec.appendChild(note);
+  const wrap = document.createElement("div");
+  wrap.style.margin = "6px 0 2px";
+  const btn = document.createElement("button");
+  btn.className = "ghost";
+  btn.textContent = "Make movable (position: relative)";
+  btn.title = "Adds position: relative to this element so you can drag it. It keeps its place in the layout; left/top offset it from there.";
+  btn.onclick = () => {
+    const before = readVals(el, ["css:position"]);
+    setLive(el, { "css:position": "relative" });
+    commit(el, before, readVals(el, ["css:position"]));
+    if (!domExtra.has(el)) domExtra.set(el, new Set());
+    domExtra.get(el).add("position"); // show the row even though the drag hasn't set left/top yet
+    setStatus(`${nameOf(el)} is now movable (position: relative) — drag it to set left/top.`, "ok");
+    renderInspector();
+  };
+  wrap.appendChild(btn);
+  sec.appendChild(wrap);
+}
+/**
+ * The editable sections of an HTML element: Element (id, class), Content (text and the tag's
+ * properties) and Style (inline style). `host` is the DOMContainer that holds it, if any.
+ */
+function domSections(el, { host = null } = {}) {
+  adoptCodeLiterals(el);
+  const m = metaOf(el);
+  const sites = (m && m.sites) || {};
+  const pendingOf = (prefix) => [...state.pending.values()].filter((r) => r.obj === el && r.prop.startsWith(prefix)).map((r) => r.prop.slice(prefix.length));
+
+  const sec = inspectorSection(host ? `HTML element <${el.tagName.toLowerCase()}>` : "Element");
+  if (!host) {
+    const b = el.getBoundingClientRect();
+    kvRow(sec, "Tag", el.tagName.toLowerCase());
+    kvRow(sec, "Box", `${Math.round(b.left)}, ${Math.round(b.top)} · ${Math.round(b.width)} × ${Math.round(b.height)} px`);
+    if (!domVisible(el)) kvRow(sec, "Visible", domHidden.has(el) ? "No — hidden by the editor" : "No");
+    const L = domLayout(el);
+    if (!L.movable) movabilityNote(sec, el, L);
+  }
+  for (const a of ["id", "className"]) if (el[a] || sites[`attr:${a}`] || pendingOf("attr:").includes(a)) sec.appendChild(domRow(el, `attr:${a}`, DOM_ATTR_LABEL[a]));
+
+  // Content: text and the tag's own properties
+  const attrs = [];
+  const pa = (n) => { if (!attrs.includes(n) && n !== "id" && n !== "className") attrs.push(n); };
+  // (a template element without a text site: its text is computed by ${…}, not editable)
+  if (!el.childElementCount && !NO_TEXT_TAGS.has(el.tagName) && !sites["attr:innerText"] && !(m && m.tpl && !sites["attr:textContent"])) pa("textContent");
+  for (const n of DOM_ATTRS[el.tagName] || []) pa(n);
+  for (const k of Object.keys(sites)) if (k.startsWith("attr:")) pa(k.slice(5));
+  for (const n of pendingOf("attr:")) pa(n);
+  const content = host ? sec : attrs.length ? inspectorSection("Content") : null;
+  for (const n of attrs) content.appendChild(domRow(el, `attr:${n}`, DOM_ATTR_LABEL[n] || n, { multiline: n === "textContent" || n === "innerText" }));
+
+  // Inline style: one row per property, plus a field to add one
+  const st = host ? sec : inspectorSection("Style");
+  if (host) { const h = document.createElement("div"); h.className = "subhead"; h.textContent = "Style"; st.appendChild(h); }
+  for (const p of cssListOf(el)) st.appendChild(domRow(el, `css:${p}`, p));
+  let list = document.getElementById("pe-css-props");
+  if (!list) {
+    list = document.createElement("datalist");
+    list.id = "pe-css-props";
+    list.innerHTML = CSS_SUGGEST.map((p) => `<option value="${p}">`).join("");
+    document.body.appendChild(list);
+  }
+  const add = cssAddField("property, e.g. color", (p) => {
+    if (!domExtra.has(el)) domExtra.set(el, new Set());
+    domExtra.get(el).add(p);
+    renderInspector();
+    const row = inspectorEl.querySelector(`[data-dprop="css:${CSS.escape(p)}"]`);
+    if (row) row.focus();
+  });
+  st.appendChild(add);
+  cssRulesSection(el);
+}
+
+// "Add" field for a CSS property: adds it on Enter, when a suggestion is picked from the list,
+// or when the field loses focus with a name typed in it.
+function cssAddField(placeholder, onAdd) {
+  const add = document.createElement("div");
+  add.className = "row single dom-add";
+  add.innerHTML = `<label>Add</label><div class="field"><input type="text" list="pe-css-props" spellcheck="false"></div>`;
+  const inp = add.querySelector("input");
+  inp.placeholder = placeholder;
+  let done = false;
+  const commit = (quiet) => {
+    if (done) return;
+    const p = inp.value.trim().toLowerCase();
+    if (!p) return;
+    if (!/^(--)?[a-z][a-z0-9-]*$/.test(p)) { if (!quiet) setStatus(`"${inp.value}" is not a CSS property name`, "err"); return; }
+    done = true;
+    onAdd(p);
+  };
+  inp.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { inp.value = ""; inp.blur(); return; }
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    commit(false);
+  });
+  // Picking a datalist option fires `input` without a typing inputType (Chrome: none, or
+  // "insertReplacementText"); typing letters does not add anything until Enter or blur.
+  inp.addEventListener("input", (e) => {
+    if ((!e.inputType || e.inputType === "insertReplacementText") && CSS_SUGGEST.includes(inp.value.trim().toLowerCase())) commit(true);
+  });
+  inp.addEventListener("change", () => commit(true));
+  return add;
+}
+
+// ---------------------------------------------------------------- CSS rules
+// Most of a page's look usually comes from CSS files, not inline style. The inspector lists the
+// rules that apply to the element (as the browser's CSSOM sees them), ties each to its place in the
+// file (the server scans it), and edits them like any other property: the change is live for every
+// element the rule applies to, and saving rewrites the declaration in the file.
+const isCssRule = (o) => !!o && typeof o === "object" && typeof o.selectorText === "string" && !!o.style && !isDom(o);
+function normSelector(s) { // same as src/css.js
+  return String(s).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\s+/g, " ").replace(/\s*([>+~,()=\[\]])\s*/g, "$1")
+    .replace(/'/g, '"').replace(/=([^\]"]+)\]/g, '="$1"]').replace(/::?(before|after|first-line|first-letter)\b/g, "::$1").trim().toLowerCase();
+}
+const normCondition = (s) => String(s).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\s+/g, "").replace(/'/g, '"').toLowerCase();
+/** The prelude of a grouping rule, as written in a file: "@media (max-width: 900px)". */
+function conditionOf(r) {
+  const C = state.win;
+  if (C.CSSMediaRule && r instanceof C.CSSMediaRule) return `@media ${r.media.mediaText}`;
+  if (C.CSSSupportsRule && r instanceof C.CSSSupportsRule) return `@supports ${r.conditionText}`;
+  if (C.CSSContainerRule && r instanceof C.CSSContainerRule) return `@container ${r.containerName ? r.containerName + " " : ""}${r.containerQuery || r.conditionText}`;
+  if (C.CSSLayerBlockRule && r instanceof C.CSSLayerBlockRule) return `@layer ${r.name}`;
+  return null;
+}
+/** Selector specificity [ids, classes, types] (close enough to order rules like the browser). */
+function specificity(sel) {
+  const s = sel.replace(/:(not|is|has)\(([^()]*)\)/g, " $2").replace(/:where\([^()]*\)/g, "");
+  const ids = (s.match(/#[\w-]+/g) || []).length;
+  const cls = (s.match(/\.[\w-]+|\[[^\]]*\]|:(?!:)[\w-]+(\([^)]*\))?/g) || []).length;
+  const types = (s.replace(/\[[^\]]*\]|\([^)]*\)/g, "").match(/(^|[\s>+~])[a-z][\w-]*|::[\w-]+/gi) || []).length;
+  return ids * 1e6 + cls * 1e3 + types;
+}
+/** Splits a selector list at its top-level commas. */
+function selectorParts(sel) {
+  const out = [];
+  let depth = 0, from = 0;
+  for (let i = 0; i < sel.length; i++) {
+    const c = sel[i];
+    if (c === "(" || c === "[") depth++;
+    else if (c === ")" || c === "]") depth--;
+    else if (c === "," && depth === 0) { out.push(sel.slice(from, i).trim()); from = i + 1; }
+  }
+  out.push(sel.slice(from).trim());
+  return out;
+}
+// Inline <style> elements the game injects at runtime (e.g. CSS imported with ?inline and added to
+// <head>) carry no file id. Give each a stable token so its rules are still sent for linking; the
+// server finds the source .css file by matching their keys.
+const inlineSheetIds = new WeakMap();
+let inlineSheetSeq = 0;
+function inlineSheetId(owner) {
+  if (!owner || owner.tagName !== "STYLE") return null;
+  if (!inlineSheetIds.has(owner)) inlineSheetIds.set(owner, `inline:${inlineSheetSeq++}`);
+  return inlineSheetIds.get(owner);
+}
+/**
+ * The style rules of the page's stylesheets that apply to `el` now, most important first:
+ * [{ rule, file, key, spec, order }]  (`file` is Vite's dev id, the stylesheet URL, or an inline token).
+ */
+function matchedRules(el) {
+  const win = state.win, out = [];
+  let order = 0;
+  for (const sheet of [...win.document.styleSheets]) {
+    const owner = sheet.ownerNode;
+    const file = (owner && owner.getAttribute && owner.getAttribute("data-vite-dev-id")) || sheet.href || inlineSheetId(owner);
+    let list;
+    try { list = sheet.cssRules; } catch { continue; } // another origin
+    const seen = new Map();
+    (function walk(rules, path, active) {
+      for (const r of rules) {
+        const cond = conditionOf(r);
+        if (cond != null) {
+          const on = active && (!(win.CSSMediaRule && r instanceof win.CSSMediaRule) || win.matchMedia(r.media.mediaText).matches);
+          walk(r.cssRules, [...path, cond], on);
+          continue;
+        }
+        if (!(win.CSSStyleRule && r instanceof win.CSSStyleRule)) continue;
+        const base = `${path.map(normCondition).join(" ")}|${normSelector(r.selectorText)}`;
+        const k = seen.get(base) || 0;
+        seen.set(base, k + 1);
+        order++;
+        if (!active) continue;
+        let spec = -1;
+        for (const part of selectorParts(r.selectorText)) {
+          try { if (el.matches(part)) spec = Math.max(spec, specificity(part)); } catch { /* pseudo-elements… */ }
+        }
+        if (spec >= 0) out.push({ rule: r, file, key: `${base}|${k}`, spec, order });
+      }
+    })(list, [], true);
+  }
+  return out.sort((a, b) => b.spec - a.spec || b.order - a.order);
+}
+const cssAsked = new WeakSet(); // rules whose place in the file was already asked for
+/** Asks the server where the rules are in their files and links them (meta: declaration + sites). */
+async function linkRules(list) {
+  const todo = list.filter((x) => !cssAsked.has(x.rule) && x.file);
+  if (!todo.length) return false;
+  todo.forEach((x) => cssAsked.add(x.rule));
+  const byFile = new Map();
+  for (const x of todo) { if (!byFile.has(x.file)) byFile.set(x.file, []); byFile.get(x.file).push(x); }
+  let res;
+  try {
+    res = await (await fetch("/__pixi-editor/api/css-rules", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sheets: [...byFile].map(([file, xs]) => ({ file, keys: xs.map((x) => x.key) })) }),
+    })).json();
+  } catch { return false; }
+  if (!res.ok) return false;
+  res.sheets.forEach((sh, i) => {
+    for (const x of [...byFile.values()][i]) {
+      const info = sh.rules[x.key];
+      if (!info) continue;
+      const m = state.pe.ensureMeta(x.rule);
+      m.declId = info.declId; m.name = info.name; m.css = true; m.file = info.file; m.line = info.line; m.props = info.props;
+      for (const [kind, id] of Object.entries(info.sites)) m.sites[kind] = { id, seq: state.pe.nextSeq() };
+      // show values as written in the file (the CSSOM normalizes colors…)
+      const probe = document.createElement("div");
+      if (!cssTyped.has(x.rule)) cssTyped.set(x.rule, {});
+      for (const [kind, text] of Object.entries(info.values)) {
+        const name = kind.slice(4);
+        probe.style.cssText = "";
+        probe.style.setProperty(name, text);
+        const stored = x.rule.style.getPropertyValue(name);
+        if (probe.style.getPropertyValue(name) === stored || name.startsWith("--")) cssTyped.get(x.rule)[name] = { raw: text, stored };
+      }
+    }
+  });
+  return true;
+}
+/** Links a new code site to an object: Pixi objects and elements through the runtime, CSS rules directly. */
+function linkSite(obj, kind, id) {
+  if (isCssRule(obj)) { const m = state.pe.ensureMeta(obj); m.sites[kind] = { id, seq: state.pe.nextSeq() }; if (m.props && !m.props.includes(kind.slice(4))) m.props.push(kind.slice(4)); }
+  else state.pe.s(obj, kind, id);
+}
+/** "CSS rules" section of the HTML inspector. */
+function cssRulesSection(el) {
+  let list;
+  try { list = matchedRules(el); } catch { return; }
+  const sec = inspectorSection("CSS rules");
+  if (!list.length) {
+    const n = document.createElement("p");
+    n.className = "note";
+    n.textContent = "No CSS rule applies to this element.";
+    sec.appendChild(n);
+    return;
+  }
+  for (const x of list.slice(0, 12)) {
+    const r = x.rule, m = metaOf(r);
+    const box = document.createElement("div");
+    box.className = "css-rule";
+    const head = document.createElement("div");
+    head.className = "css-rule-head";
+    head.innerHTML = `<code></code><span class="where"></span>`;
+    head.querySelector("code").textContent = r.selectorText;
+    const where = head.querySelector(".where");
+    if (m && m.file) {
+      where.textContent = `${m.file}:${m.line}`;
+      where.title = "Open in VS Code";
+      where.classList.add("link");
+      where.onclick = () => openInIde(m.file, m.line, 1);
+    } else where.textContent = cssAsked.has(r) ? "not linked" : "…";
+    box.appendChild(head);
+    let count = 0;
+    try { count = state.win.document.querySelectorAll(r.selectorText).length; } catch { /* */ }
+    if (count > 1) {
+      const n = document.createElement("p");
+      n.className = "note";
+      n.textContent = `Applies to ${count} elements: changes affect all of them.`;
+      box.appendChild(n);
+    }
+    for (const p of cssListOf(r)) box.appendChild(domRow(r, `css:${p}`, p));
+    if (m && m.declId) {
+      const add = cssAddField("property", (p) => {
+        if (!domExtra.has(r)) domExtra.set(r, new Set());
+        domExtra.get(r).add(p);
+        renderInspector();
+        const f = [...inspectorEl.querySelectorAll(".css-rule")].map((b) => b.querySelector(`[data-dprop="css:${CSS.escape(p)}"]`)).find((q) => q && q.closest(".css-rule") && q.closest(".css-rule")._rule === r);
+        if (f) f.focus();
+      });
+      box.appendChild(add);
+    }
+    box._rule = r;
+    sec.appendChild(box);
+  }
+  if (list.length > 12) kvRow(sec, "", `… ${list.length - 12} more rules`);
+  // first time: find the rules in their files, then show them linked
+  linkRules(list).then((changed) => { if (changed && (state.domSelected === el || domElementOf(state.selected) === el)) renderInspector(); });
+}
+
+/** Inspector for an HTML element of the page: its properties and inline style (editable) and its code. */
+function renderDomInspector(el) {
+  inspectorEl.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "obj-head";
+  head.innerHTML = `<div class="obj-row"><input class="obj-name" readonly spellcheck="false" title="The element's variable in the code"></div><div class="obj-type"></div>`;
+  head.querySelector(".obj-name").value = nameOf(el);
+  head.querySelector(".obj-type").textContent = `HTML element ${typeOf(el)}${el.childElementCount ? ` · ${el.childElementCount} children` : ""}`;
+  inspectorEl.appendChild(head);
+  domSections(el);
+
+  // Code: where it is created and the lines that set its properties
+  const m = metaOf(el);
+  const code = inspectorSection("Code");
+  const box = document.createElement("div");
+  box.className = "srcs";
+  code.appendChild(box);
+  const note = (text, warn = false) => {
+    const n = document.createElement("p");
+    n.className = "note" + (warn ? " warn" : "");
+    n.textContent = text;
+    box.appendChild(n);
+  };
+  const ids = sourceIds(el);
+  if (!ids.length) {
+    note("Not linked to a line of code (it is probably made with innerHTML or by a library). You can try changes here, but they can't be saved.", true);
+  } else {
+    note("Loading…");
+    loadInfo(ids).then(() => {
+      if (state.domSelected !== el) return;
+      box.innerHTML = "";
+      // one card per line (a template tag holds the element and all its attributes)
+      const lines = new Map();
+      for (const id of ids) {
+        const inf = state.info.get(id);
+        if (!inf) continue;
+        const key = `${inf.file}:${inf.line}`;
+        if (!lines.has(key)) lines.set(key, { inf, ids: [] });
+        lines.get(key).ids.push(id);
+      }
+      for (const { inf, ids: group } of lines.values()) {
+        const card = document.createElement("div");
+        card.className = "src";
+        card.innerHTML = `<div class="loc"><b></b><span class="kind"></span><button class="open-ide" title="Open this line in VS Code">Open ↗</button></div><code></code>`;
+        card.querySelector("b").textContent = `${inf.file}:${inf.line}`;
+        const kinds = group.map((id) => (id === m.declId ? "creation" : siteKindLabel(state.info.get(id).kind)));
+        card.querySelector(".kind").textContent = kinds.length > 3 ? `${kinds.slice(0, 2).join(", ")} +${kinds.length - 2}` : kinds.join(", ");
+        card.querySelector(".kind").title = kinds.join(", ");
+        card.querySelector("code").textContent = inf.code;
+        card.querySelector(".open-ide").onclick = () => openInIde(inf.file, inf.line, inf.col);
+        card.title = "Double-click to open in VS Code";
+        card.ondblclick = () => openInIde(inf.file, inf.line, inf.col);
+        box.appendChild(card);
+        // a line run several times (a loop, a template in .map()) makes several elements
+        const uses = Math.max(0, ...group.filter((id) => m.tpl || id !== m.declId).map((id) => state.pe.siteUse.get(id) || 0));
+        if (uses > 1) note(`⚠ This line affects ${uses} elements: saving applies the change to all of them.`, true);
+      }
+      note(m.html
+        ? "Saving rewrites this element in index.html."
+        : m.tpl
+          ? "Written in an HTML template (innerHTML): saving rewrites its tag there. Parts written with ${…} are computed by code and stay as they are."
+          : "Saving replaces the values on these lines; a property without a line gets one right after the element is created.");
+    });
+  }
+  refreshDomValues(true);
+}
+/** `style.fontSize` (as the instrumenter records `el.style.fontSize = …`) -> `css:font-size`. */
+const siteKindLabel = (kind) => String(kind || "").replace(/^style\.(\w+)$/, (_, q) => "css:" + q.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()));
 
 // ---------------------------------------------------------------- open code in VS Code
 async function openInIde(file, line = 1, col = 1) {
@@ -2184,8 +3391,10 @@ function renderComponentValues() {
 }
 
 function refreshInspectorValues(force = false) {
+  if (state.domSelected) { refreshDomValues(force); return; }
   const o = state.selected;
   if (!o) return;
+  if (domElementOf(o)) refreshDomValues(force);
   if (usesAnchor(o)) {
     for (const b of inspectorEl.querySelectorAll(".preset")) {
       b.classList.toggle("on", Math.abs(o.anchor.x - b.dataset.fx) < 1e-3 && Math.abs(o.anchor.y - b.dataset.fy) < 1e-3);
@@ -2427,6 +3636,8 @@ applyView();
 const createMenu = $("#create-menu");
 $("#btn-create").onclick = (e) => {
   e.stopPropagation();
+  // HTML objects need Pixi's DOMContainer (recent pixi.js 8 versions)
+  createMenu.classList.toggle("no-html", !(state.PIXI && state.PIXI.DOMContainer));
   createMenu.classList.toggle("hidden");
 };
 document.addEventListener("click", () => createMenu.classList.add("hidden"));
@@ -2464,6 +3675,10 @@ async function createObject(kind) {
     texture = await pickTexture();
     if (!texture) return;
   }
+  if (kind.startsWith("html") && !state.PIXI.DOMContainer) {
+    setStatus("This project's pixi.js has no DOMContainer: update pixi.js to create HTML objects.", "err");
+    return;
+  }
   // Put it in the middle of what you're looking at.
   const W = overlay.clientWidth, H = overlay.clientHeight;
   const center = overlayToGlobal(W / 2, H / 2);
@@ -2484,11 +3699,19 @@ async function createObject(kind) {
   else if (kind === "sprite") { obj = P.Sprite.from(texture); obj.anchor.set(0.5); }
   else if (kind === "text") { obj = new P.Text({ text: "New text", style: { fill: 0xffffff, fontSize: 32 } }); obj.anchor.set(0.5); }
   else if (kind === "rect") obj = new P.Graphics().rect(-50, -50, 100, 100).fill(0xffffff);
+  else if (res.html) {
+    // DOMContainer: the same element the code builds
+    const el = state.win.document.createElement(res.html.tag);
+    for (const [k, v] of Object.entries(res.html.props || {})) el[k] = v;
+    for (const [k, v] of Object.entries(res.html.style || {})) el.style.setProperty(k, v);
+    obj = new P.DOMContainer({ element: el, anchor: 0.5 });
+  }
   else obj = new P.Graphics().circle(0, 0, 50).fill(0xffffff);
   obj.position.set(Math.round(local.x), Math.round(local.y));
   parent.addChild(obj);
   state.pe.d(obj, res.declId, res.name, res.opts);
   for (const st of res.sites) state.pe.s(obj, st.kind, st.id);
+  for (const st of res.elementSites || []) state.pe.s(obj.element, st.kind, st.id);
   render();
   state.expanded.add(parent);
   state.treeSig = "";
@@ -2896,6 +4119,8 @@ function cloneLive(o) {
       c = new P.Sprite(o.texture);
     } else if (P.Graphics && o instanceof P.Graphics) {
       c = new P.Graphics(o.context);
+    } else if (P.DOMContainer && o instanceof P.DOMContainer && o.element) {
+      c = new P.DOMContainer({ element: o.element.cloneNode(true) });
     } else if (o.constructor === P.Container && !o.children.length) {
       c = new P.Container();
     }
@@ -2928,6 +4153,7 @@ async function duplicateSelected() {
   p.addChildAt(c, p.getChildIndex(o) + 1);
   state.pe.d(c, res.declId, res.name, res.opts);
   for (const st of res.sites || []) state.pe.s(c, st.kind, st.id);
+  for (const st of res.elementSites || []) if (c.element) state.pe.s(c.element, st.kind, st.id);
   state.treeSig = "";
   select(c);
   render();
@@ -3206,7 +4432,7 @@ async function markLinkedFile(o) {
     await loadInfo([m.declId]);
     file = state.info.get(m.declId)?.file || null;
   }
-  if (state.selected !== o) return;
+  if ((state.selected || state.domSelected) !== o) return;
   filesState.linked = file ? file.split("\\").join("/") : null;
   for (const r of filesEl.querySelectorAll(".file")) r.classList.toggle("linked", r.dataset.path === filesState.linked);
 }
@@ -3348,7 +4574,7 @@ const fileUrl = (p) => `/__pixi-editor/api/file?path=${encodeURIComponent(p)}`;
 /** Shows a project file in the inspector (the scene selection is cleared). */
 function openFileView(e) {
   state.fileView = e;
-  if (state.selected) { state.selected = null; renderTree(); render(); }
+  if (state.selected || state.domSelected) { state.selected = state.domSelected = null; renderTree(); render(); }
   renderInspector();
 }
 
@@ -3907,7 +5133,7 @@ function resetProjectView() {
   state.win = state.pe = state.app = state.PIXI = null;
   state.compMod = null;
   state.spineMod = undefined;
-  state.selected = state.hover = null;
+  state.selected = state.hover = state.domSelected = null;
   state.fileView = null;
   state.pending.clear(); state.undo = []; state.redo = [];
   state.compOriginal.clear();

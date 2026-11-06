@@ -10,7 +10,8 @@
 - Keep the editor UI dependency-free (plain HTML/CSS/JS in `editor/`) and runtime deps pure JS.
 - Run `npm test` after changing `src/instrument.js` or `src/writeback.js`, and `npm run e2e` after
   changing the editor UI, the plugin or the server. Add a scenario to `test/e2e/run.js` for new
-  features (fixtures in `test/fixtures`: `basic` = plain code, `factory` = helper functions).
+  features (fixtures in `test/fixtures`: `basic` = plain code, `factory` = helper functions,
+  `templates` = UI from an `innerHTML` template styled by a CSS file).
 - Git is Diego's job: change files only, never commit or push.
 - New projects come from `templates/new-project` (dotfiles stored without the dot) and the versions
   in `src/server.js → NEW_PROJECT_*`. A generated project must pass `tsc`, `eslint .`,

@@ -1,0 +1,26 @@
+{
+  "htmlPanel": {
+    "label": "Panel",
+    "tag": "div",
+    "props": {},
+    "style": { "width": "240px", "height": "140px", "background": "#1d2433", "border-radius": "12px" }
+  },
+  "htmlButton": {
+    "label": "Button",
+    "tag": "button",
+    "props": { "textContent": "Button" },
+    "style": { "padding": "10px 24px", "font-size": "18px", "color": "#ffffff", "background": "#ff3388", "border": "none", "border-radius": "8px", "cursor": "pointer" }
+  },
+  "htmlInput": {
+    "label": "Input",
+    "tag": "input",
+    "props": { "placeholder": "Type here", "maxLength": 20 },
+    "style": { "padding": "8px 12px", "font-size": "18px", "border": "1px solid #444", "border-radius": "8px" }
+  },
+  "htmlText": {
+    "label": "Text",
+    "tag": "div",
+    "props": { "textContent": "New text" },
+    "style": { "color": "#ffffff", "font-size": "20px", "font-family": "Arial, sans-serif" }
+  }
+}

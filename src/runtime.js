@@ -11,6 +11,10 @@
   function isDisplay(o) {
     return !!o && typeof o === "object" && Array.isArray(o.children) && typeof o.addChild === "function" && !!o.position;
   }
+  // HTML elements the game creates (menus, forms…): shown by the editor next to the Pixi scene.
+  function isDom(o) {
+    return !!o && typeof o === "object" && o.nodeType === 1 && typeof o.getBoundingClientRect === "function";
+  }
   function isApp(o) {
     return !!o && typeof o === "object" && !!o.stage && typeof o.init === "function" && !isDisplay(o);
   }
@@ -78,6 +82,47 @@
     }
   }
 
+  // ---- Elements written in index.html: the editor's server marked each tag with
+  // data-pe="<declId> <kind>=<siteId> …". Read them into the elements' meta and remove the marks.
+  // Tags written in innerHTML templates carry the same marks plus "tpl"; they appear whenever the
+  // game sets innerHTML, so new elements are adopted as they are added to the page.
+  function adoptHtml(root) {
+    var els = (root || document).querySelectorAll("[data-pe]");
+    var list = root && root.hasAttribute && root.hasAttribute("data-pe") ? [root].concat(Array.prototype.slice.call(els)) : els;
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i];
+      var parts = (el.getAttribute("data-pe") || "").split(" ");
+      el.removeAttribute("data-pe");
+      var hm = m(el);
+      if (hm.declId) continue; // already linked (created by code)
+      var tpl = parts[1] === "tpl";
+      hm.declId = parts[0];
+      hm.html = !tpl;
+      hm.tpl = tpl;
+      use(parts[0]);
+      for (var k = 1; k < parts.length; k++) {
+        var eq = parts[k].lastIndexOf("=");
+        if (eq < 1) continue;
+        var kind = parts[k].slice(0, eq), sid = parts[k].slice(eq + 1);
+        if (hm.sites[kind]) continue; // a line of code sets it later: that one wins
+        hm.sites[kind] = tpl ? { id: sid, seq: ++seq, tpl: true } : { id: sid, seq: ++seq, html: true };
+        use(sid);
+      }
+    }
+  }
+  if (typeof document !== "undefined") {
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { adoptHtml(); });
+    else adoptHtml();
+    if (typeof MutationObserver !== "undefined") {
+      new MutationObserver(function (records) {
+        for (var r = 0; r < records.length; r++) {
+          var added = records[r].addedNodes;
+          for (var a = 0; a < added.length; a++) if (added[a].nodeType === 1) adoptHtml(added[a]);
+        }
+      }).observe(document.documentElement, { childList: true, subtree: true });
+    }
+  }
+
   globalThis.__PIXI_EDITOR__ = {
     // Code site that sets a property: returns the same object.
     s: function (o, kind, id, transient) {
@@ -88,6 +133,18 @@
         if (cm.childSite !== id) use(id);
         cm.childSite = id;
         if (!cm.sites.parent) cm.sites.parent = { id: id, seq: ++seq };
+      } else if (isDom(o)) {
+        // HTML element: inline style (css:font-size) and properties (attr:placeholder).
+        // `el.style.fontSize = …` arrives with the Pixi text-style kind (style.fontSize).
+        var dk = /^(css|attr):/.test(kind) ? kind : /^style\.\w+$/.test(kind) ? "css:" + kind.slice(6).replace(/[A-Z]/g, function (c) { return "-" + c.toLowerCase(); }) : null;
+        if (!dk) return o;
+        var hm = m(o);
+        var hp = hm.sites[dk];
+        if (transient && hp && !hp.transient) return o;
+        if (!hp || hp.id !== id) use(id);
+        hm.sites[dk] = transient ? { id: id, seq: ++seq, transient: true } : { id: id, seq: ++seq };
+      } else if (isDisplay(o) && /^(css|attr):/.test(kind)) {
+        // a Pixi object with a `style` or `value` of its own: not an HTML property
       } else if (isDisplay(o)) {
         var mm = m(o);
         var prev = mm.sites[kind];
@@ -120,6 +177,9 @@
           var km = meta.get(o.children[i]);
           if (km && km.childSite) { km.sites.parent = { id: km.childSite, seq: ++seq }; km.childSite = null; }
         }
+      } else if (isDom(o)) {
+        var dm = m(o);
+        if (!dm.declId) { dm.declId = id; dm.name = name; dm.dom = true; use(id); }
       }
       return o;
     },

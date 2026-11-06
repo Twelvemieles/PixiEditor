@@ -67,7 +67,7 @@ suggestions, and changes the game makes itself (`history.replaceState`) show up 
 | **Select** | Click selects the top-most object. **Alt+click** cycles through the objects stacked under the pointer. Pressing inside the current selection drags it even if something is on top. |
 | **Move tool (V)** | Drag to move (Shift = one axis), corner handles scale (Shift = free X/Y), the round handle above rotates (Shift = 15° steps). Arrow keys = 1 px (Shift = 10 px). |
 | **Pivot tool (P)** | Drag inside the object to place its origin — `anchor` for sprites/texts, `pivot` for everything else. The object stays in place (its position is compensated). Shift snaps to corners/edges/center. |
-| **Hierarchy** | The scene tree. A pink dot means the object is linked to a line of code. **Find** (`Cmd/Ctrl+F`) filters it by name or type; Enter jumps through the matches. Double-click to rename. **Drag a row onto a container** to move the object into it (it stays in the same place on screen), or onto the **top/bottom edge** of a row to draw it before/after that object. The eye hides an object while editing (e.g. a popup covering the screen) — this is never saved. |
+| **Hierarchy** | The scene tree. A pink dot means the object is linked to a line of code. **Find** (`Cmd/Ctrl+F`) filters it by name or type; Enter jumps through the matches. Double-click to rename. **Drag a row onto a container** to move the object into it (it stays in the same place on screen), or onto the **top/bottom edge** of a row to draw it before/after that object. The eye hides an object while editing (e.g. a popup covering the screen) — this is never saved. **Page (HTML)**, below the scene, lists the HTML the game puts on top of the canvas (menus, name forms… made with `document.createElement` or in `index.html`). Click one there or in the viewport to edit it (see [HTML on top of the canvas](#html-on-top-of-the-canvas)). |
 | **Project** | Below the hierarchy: the project's files (without `node_modules`, `dist` or hidden files). Click a folder to open it, a file to see it in the inspector (see [Previewing files](#previewing-files)), double-click to open it in VS Code. "Find file…" searches the whole project. The file that creates the selected object is marked in pink. Click **Project** to collapse the panel. |
 | **Panels** | Drag the lines between the panels to resize them (left column, inspector, and hierarchy vs. files); double-click a line to reset it. Sizes are remembered. |
 | **Inspector** | Name (saved as the object's `label`), position, scale, rotation, alpha, pivot/anchor with a 3×3 origin grid, and **Appearance**: texture of a sprite, skeleton and animation of a spine, tint, text, text color, font, size, weight, style, alignment, letter spacing and shape fill colors. Drag a field's label to scrub the value, like in Unity. Below, the lines of code that control the object. |
@@ -75,7 +75,7 @@ suggestions, and changes the game makes itself (`history.replaceState`) show up 
 | **Mute** | The speaker button next to the zoom (or `M`) mutes the game only — sound previews in the inspector still play. It is remembered, and applied before the game starts. |
 | **Screen size** | The menu next to the zoom (bottom right) gives the game a phone, tablet, laptop or custom size, to test the layout (and the Anchor component) at other resolutions. Games with a fixed canvas size keep their size. |
 | **Duplicate / Delete** | `Cmd/Ctrl+D` or ⧉ copies the object's code; `Delete` or 🗑 removes it (with a preview of the lines). See [Duplicating and deleting](#duplicating-and-deleting). |
-| **Create** | **+ Create** in the hierarchy: Container, Sprite (pick one of the textures the game has loaded), Text, Rectangle or Circle. See [Creating objects](#creating-objects). |
+| **Create** | **+ Create** in the hierarchy: Container, Sprite (pick one of the textures the game has loaded), Text, Rectangle or Circle; and HTML (Panel, Button, Input, Text). See [Creating objects](#creating-objects). |
 | **Components** | "Add component…" in the inspector: **Anchor**, **Button**, **Tween**, or your own **behaviors** (see below). |
 | **Code** | Every line that controls the selected object is listed in the inspector; **Open ↗** (or double-click) opens it in VS Code at that line. |
 | **Save** | `Cmd/Ctrl+S` opens **Review changes**: every change (with **Discard**) and the exact lines that will change in each file. Enter saves. Untick "Review before saving" to save directly. Undo `Cmd/Ctrl+Z`, redo `Cmd/Ctrl+Shift+Z`. |
@@ -102,6 +102,26 @@ From then on it is a normal object: move, rename, recolor or add components to i
 The container must be stored in a variable in the code. Variable names never clash with existing
 ones (`label`, `label2`…), and the project's quote style and Prettier formatting are respected.
 
+**HTML objects** (Panel, Button, Input, Text) are real HTML inside the scene, with Pixi's
+`DOMContainer`: they move, scale, rotate and fade with their container, and follow the canvas when it
+is resized. Use them for name fields, forms and anything that needs the browser's text input. The
+editor writes the element and its starting style, one line each:
+
+```ts
+const input = new DOMContainer({ element: document.createElement("input"), anchor: 0.5 });
+input.element.placeholder = "Type here";
+input.element.style.fontSize = "18px";
+input.position.set(480, 270);
+ui.addChild(input);
+```
+
+Select one (in the hierarchy or by clicking it) to move it like any object; its inspector also shows
+the element's text, properties and style (see [HTML on top of the canvas](#html-on-top-of-the-canvas)
+for how they are saved). A style without a line gets one after the container's code
+(`input.element.style.color = "#fff";`). Things to know: `DOMContainer` is marked experimental by
+Pixi; HTML is always drawn above the canvas (draw order only matters among HTML objects); filters
+and masks don't apply to it. The menu shows HTML only when the project's pixi.js has `DOMContainer`.
+
 ## Previewing files
 
 Click a file in **Project** and the inspector shows it:
@@ -127,6 +147,57 @@ shared through a variable (`style: titleStyle`) is not changed from one object.
 Spines show an **Animation** menu with the skeleton's animations; the chosen one plays in a loop while
 you edit. On save, the animation name is written where the code chooses it:
 `spine.state.setAnimation(0, "idle", true)` or `createSpineAnimation({ animationName: "idle" })`.
+
+## HTML on top of the canvas
+
+Many games draw menus and forms with HTML (a name screen, a login form) on top of the canvas. They are
+listed under **Page (HTML)** in the hierarchy and selected like any object; a click in the viewport
+picks the HTML first, since it is drawn above the canvas.
+
+The inspector shows the element's **Text**, its tag's properties (placeholder, value and type for
+inputs, src for images…) and its **inline style**, one row per property. Type a value and press Enter;
+arrow keys change numbers and keep the unit (`1.5em` → `1.6em`, Shift ×10). **Add** adds a style
+property. A pink dot next to a name means a line of code already sets it.
+
+**Moving and resizing.** Drag a selected element to move it, or use the arrow keys (1px, Shift 10px);
+drag its corners to resize it. Loose HTML is placed by CSS, so this changes CSS:
+
+- Moving changes `left`/`top`, or `right`/`bottom` when that is the edge that holds the element
+  (a menu at `right: 16px` stays anchored to the right). It needs `position: absolute`, `fixed` or
+  `relative`; an element placed by its parent (in a flex column, for example) can't be dragged: the
+  status bar says so, and it can still be resized from its corner.
+- Resizing changes `width`/`height`. From a left or top corner, the opposite edge stays in place.
+- Values keep their unit: `10%` stays a percentage of the containing box, `100vw` becomes `78.49vw`,
+  `1.5em` stays in em. A value that wasn't set (`auto`) is written in px; one written with `calc()`
+  or `var()` is left as is. Small elements show no corners (they would block moving them).
+
+**CSS rules.** Below the inline style, the inspector lists the CSS rules that apply to the element
+(from the project's CSS files, most specific first, `@media` included), each with its file and line.
+Edit a value or **Add** a property to a rule: the change is live for every element the rule applies
+to (the inspector says how many), and saving rewrites the declaration in the CSS file, keeping its
+layout. Dragging or resizing an element whose position or size comes from a rule changes that rule,
+not the element's inline style.
+
+**HTML templates.** HTML written in a string — `mount.innerHTML = \`<section class="panel">…\``,
+`outerHTML`, `insertAdjacentHTML(…)`, and templates nested in their `${…}` (like `.map(…)`) — is
+linked too: each tag's fixed attributes, text and inline style are saved back into the template,
+escaped for its string. Parts written with `${…}` are computed by code: they are shown, never
+overwritten. A tag inside `.map()` makes several elements; the inspector warns that a change
+applies to all of them.
+
+On save:
+
+- Elements made with `document.createElement` are saved on the lines that set them —
+  `el.style.fontSize = "1.5em"`, `el.style.setProperty("color", …)`, `Object.assign(el.style, { … })`,
+  `el.placeholder = "…"`, `el.setAttribute("maxlength", "20")`, `el.textContent = "…"` — keeping the
+  literal's kind (string, number, quotes). A property without a line gets one after the element's
+  creation: `playBtn.style.color = "#ff0000";`.
+- Elements written in **index.html** are saved there: style declarations, attributes and text are
+  replaced in place, new ones are added to the tag (`style="…; font-size: 14px"`). Vite reloads the page
+  after an HTML change; the editor comes back to Edit mode on the same element.
+- Values computed by code (`` `${size}px` ``) are not overwritten. Elements built by libraries or
+  with DOM calls the editor doesn't follow are shown but not saved. The editor's **eye** only hides an
+  element while editing.
 
 ## Duplicating and deleting
 
@@ -328,8 +399,12 @@ src/instrument.js    Parses code (Babel) and marks the code site of each propert
 src/writeback.js     Computes text edits ("adjust only the number")
 src/runtime.js       Injected into the game: links objects to lines of code
 src/refactor.js      Deleting, duplicating and reordering an object's code
+src/html.js          The project's index.html: its elements' attributes, style and text, and saving them
+                     (also HTML written in innerHTML templates)
+src/css.js           The project's CSS files: rules and declarations, and saving them
 templates/           pixi-components/ (components, copied into projects by category),
-                     components-catalog.json (their inspector fields), behavior.ts, new-project/
+                     components-catalog.json (their inspector fields), behavior.ts, new-project/,
+                     html-kinds.json (what Create → HTML writes)
 editor/              UI (dependency-free HTML/CSS/JS)
 test/run.js          npm test (unit tests: instrumenting and rewriting code)
 test/e2e/run.js      npm run e2e (browser tests on the projects in test/fixtures)
@@ -344,10 +419,11 @@ npm test                         # unit tests (a second)
 npm run e2e                      # browser tests (~30 s)
 ```
 
-`npm run e2e` copies the two fixture projects in `test/fixtures` (`basic`: plain `new X()` code;
-`factory`: `createSprite({...})` helpers, `TEX` constants, Prettier with single quotes) to
+`npm run e2e` copies the fixture projects in `test/fixtures` (`basic`: plain `new X()` code;
+`factory`: `createSprite({...})` helpers, `TEX` constants, Prettier with single quotes;
+`templates`: the UI as one `innerHTML` template styled by a CSS file) to
 `test/.tmp`, starts Pixi Editor on each one, drives it in Chromium and checks the code it writes:
-search, moving, text style, creating, the review dialog, duplicate and delete, parent and draw order,
+search, moving, text style, creating, HTML elements of the page (also from innerHTML templates and CSS rules), the review dialog, duplicate and delete, parent and draw order,
 textures, and that Prettier-clean files stay clean. `npm run e2e -- factory` runs only the scenarios
 whose name contains "factory"; `HEADED=1 npm run e2e` shows the browser.
 
