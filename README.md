@@ -1,323 +1,217 @@
 # Pixi Editor
 
-A visual editor for **existing PixiJS v8 projects** written code-only.
-Open your team's project, move objects in the scene like in Unity or Cocos, and on save
-**the editor rewrites the numbers in the source code**. The team keeps working in code only and
-sees the changes as a regular git diff.
+A visual scene editor for **PixiJS v8 projects that live entirely in code**.
+
+Open a project your team wrote by hand, arrange the scene the way you would in Unity or
+Cocos, and when you save, the editor writes the change back into the source. Nobody has to
+leave their code: the edits land as an ordinary git diff.
+
+![The Pixi Editor window: scene tree on the left, the game in the middle with a selected object, and the inspector on the right](docs/images/editor.png)
+
+Drag an object two pixels to the right and the editor doesn't dump a new scene file on you.
+It edits the one line that set the position, and leaves the rest of the expression alone:
 
 ```ts
 // Before
 scoreText.position.set(22, 18);
 netText.position.set(app.renderer.width - 10, 10);
 
-// After dragging in the editor and saving
+// After nudging both in the editor and saving
 scoreText.position.set(40, 26);
 netText.position.set(app.renderer.width - 24, 10);   // still anchored to the right edge
 ```
 
-## Usage
+## Why it exists
+
+Most scene editors want to own your project. They add a runtime, a scene format, a build
+step, and from then on the layout lives in their files instead of your code. That trade is
+fine until you have a team that would rather keep everything in TypeScript and review it on
+GitHub.
+
+Pixi Editor takes the opposite approach. It reads your existing code, shows you the scene it
+produces, and when you move something it changes the number that was already there. There is
+no scene file, no lock-in, and no "export" step. Close the editor and the project is exactly
+what it was, plus the lines you changed.
+
+## Highlights
+
+- **It edits your real source.** Moving, scaling, recoloring or renaming an object rewrites
+  the exact line that set that value, keeping expressions like `app.renderer.width - 24` or
+  `44 + i * 22` intact. When a value has no line yet, one is inserted right after the object
+  is created.
+- **No changes to your project.** The editor runs *your* Vite with one plugin added. Your
+  config, your dependencies and your code are left as they are.
+- **A real inspector.** Position, scale, rotation, alpha, pivot and anchor, plus textures,
+  tint, spine animations, and full text styling. Every field lists the lines of code behind
+  it, one click from your editor.
+- **It reads code the way people actually write it.** Plain `new Sprite()`, TypeScript casts
+  (`new Application() as GameApp`), and factory helpers (`createSprite({ position: [x, y] })`).
+- **HTML and CSS, not just the canvas.** Menus and forms built with the DOM are selectable
+  and draggable; the editor writes back their inline styles, attributes, text and even the
+  CSS rules that position them.
+- **Structural edits stay honest.** Create, duplicate, delete, reparent and reorder objects
+  as plain code. When other code depends on an object, the editor refuses and tells you why
+  instead of guessing.
+- **Nothing is saved behind your back.** Every change goes through a review dialog that shows
+  the diff per file, with a Discard button next to each one.
+
+## Getting started
 
 ```bash
-cd ~/ClaudeProjects/PixiEditor
-npm install                     # first time only
-node bin/pixi-editor.js         # opens http://localhost:5180/__pixi-editor/
+cd PixiEditor
+npm install                 # first run only
+node bin/pixi-editor.js     # opens http://localhost:5180/__pixi-editor/
 ```
 
-**macOS without the Terminal:** double-click **`PixiEditor.app`** in this folder (drag it to the Dock to
-keep it there; it has to stay in this folder, the Dock only keeps a shortcut). It finds Node.js by itself
-(nvm, Homebrew, Volta, fnm, asdf or nodejs.org), runs `npm install` the first time and whenever
-`package-lock.json` changes, starts the editor in the background and opens the browser. If the editor is
-already running it just opens the browser again; **Quit** in the editor's top bar stops it. Problems show
-up as a dialog, and the log is in `~/.pixi-editor/editor.log`. `pixi-editor.command` does the same in a
-visible Terminal window (Ctrl+C stops it). If Node.js is somewhere unusual, put the full path of the
-`node` binary in `~/.pixi-editor/node-path`. The first time, macOS may ask to confirm opening it
-(right-click → Open).
+Options: `--port 5200`, `--no-open`, or a project path to open straight away
+(`node bin/pixi-editor.js ~/games/firstProject`).
 
-Pick a project inside the editor:
+**On macOS without a terminal**, double-click **`PixiEditor.app`** in this folder (drag it to
+the Dock to keep it around). It locates Node.js on its own, runs `npm install` the first time,
+starts the editor in the background and opens the browser. **Quit** in the top bar stops it,
+and the log lives in `~/.pixi-editor/editor.log`. `pixi-editor.command` does the same in a
+visible Terminal window.
 
-- **Search bar** (top bar, `Cmd/Ctrl+P`): filters recent projects as you type; paste or type a folder
-  path and press Enter to open it.
-- **Browse…** (`Cmd/Ctrl+O`): opens the system folder picker (Finder on macOS, the folder dialog on
-  Windows, zenity/kdialog on Linux).
+## Opening a project
 
-Or start a new one: **＋ New project…** on the start screen asks for a name and a location (with
-the system folder picker), writes a Vite + PixiJS v8 + TypeScript game with a first scene (optionally
-with ESLint + Prettier), runs `npm install` and opens it. Network errors during `npm install` are retried automatically, and
-packages already in npm's cache are reused; if it still fails, **Retry** tries again. Opening a project
-that has no `node_modules` offers **Install dependencies** too. **⌂ Close project** in the top bar stops the
-project and goes back to the start screen.
+You pick the project from inside the app, so there is no config file to point anywhere:
 
-You can also pass a project directly: `node bin/pixi-editor.js ~/pixi/firstProject`.
-Options: `--port 5200`, `--no-open`. Recent projects are stored in `~/.pixi-editor/recent.json`.
+- **Search bar** (`Cmd/Ctrl+P`) filters your recent projects as you type, or takes a pasted
+  folder path.
+- **Browse…** (`Cmd/Ctrl+O`) opens the system folder picker.
+- **＋ New project…** scaffolds a fresh Vite + PixiJS v8 + TypeScript game (optionally with
+  ESLint and Prettier), installs it and opens it.
 
-The project's own configuration is never modified: the editor runs the project's own Vite with the
-editor plugin added. If the game needs a backend (e.g. the WebSocket server in `server/`), start it
-as usual.
+The only requirements are that the project uses Vite and creates its app with
+`new Application()` somewhere. If the game talks to a backend, start that the way you normally
+would; the editor only runs the front end.
 
-**Game URL bar** (top of the scene): shows the URL the game runs at. Type query parameters
-(`?lang=es&token=abc`, or just `lang=es&token=abc`) and press Enter to reload the game with them; Esc
-reverts and ✕ removes them. The URL is remembered per project, with the last ones you used as
-suggestions, and changes the game makes itself (`history.replaceState`) show up in the bar.
+## Inside the editor
 
-## Working in the editor
+The game boots in **Play** so loading screens, tweens and intros run normally. When you reach
+the screen you want to work on, switch to **Edit** (`Cmd/Ctrl+E`): the game pauses and objects
+become selectable.
 
 | | |
 |---|---|
-| **Play / Edit** | The game starts in **Play** so it can boot normally (loading screens, tweens…). Switch to **Edit** (`Cmd/Ctrl+E`) when you reach the screen you want: the game pauses and you can select objects. |
-| **Select** | Click selects the top-most object. **Alt+click** cycles through the objects stacked under the pointer. Pressing inside the current selection drags it even if something is on top. |
-| **Move tool (V)** | Drag to move (Shift = one axis), corner handles scale (Shift = free X/Y), the round handle above rotates (Shift = 15° steps). Arrow keys = 1 px (Shift = 10 px). |
-| **Pivot tool (P)** | Drag inside the object to place its origin — `anchor` for sprites/texts, `pivot` for everything else. The object stays in place (its position is compensated). Shift snaps to corners/edges/center. |
-| **Hierarchy** | The scene tree. A pink dot means the object is linked to a line of code. **Find** (`Cmd/Ctrl+F`) filters it by name or type; Enter jumps through the matches. Double-click to rename. **Drag a row onto a container** to move the object into it (it stays in the same place on screen), or onto the **top/bottom edge** of a row to draw it before/after that object. The eye hides an object while editing (e.g. a popup covering the screen) — this is never saved. **Page (HTML)**, below the scene, lists the HTML the game puts on top of the canvas (menus, name forms… made with `document.createElement` or in `index.html`). Click one there or in the viewport to edit it (see [HTML on top of the canvas](#html-on-top-of-the-canvas)). |
-| **Project** | Below the hierarchy: the project's files (without `node_modules`, `dist` or hidden files). Click a folder to open it, a file to see it in the inspector (see [Previewing files](#previewing-files)), double-click to open it in VS Code. "Find file…" searches the whole project. The file that creates the selected object is marked in pink. Click **Project** to collapse the panel. |
-| **Panels** | Drag the lines between the panels to resize them (left column, inspector, and hierarchy vs. files); double-click a line to reset it. Sizes are remembered. |
-| **Inspector** | Name (saved as the object's `label`), position, scale, rotation, alpha, pivot/anchor with a 3×3 origin grid, and **Appearance**: texture of a sprite, skeleton and animation of a spine, tint, text, text color, font, size, weight, style, alignment, letter spacing and shape fill colors. Drag a field's label to scrub the value, like in Unity. Below, the lines of code that control the object. |
-| **Zoom / pan** | Mouse wheel or pinch zooms around the pointer; Space+drag or middle-drag pans. `F` fits the game, `0` resets to 100%. |
-| **Mute** | The speaker button next to the zoom (or `M`) mutes the game only — sound previews in the inspector still play. It is remembered, and applied before the game starts. |
-| **Screen size** | The menu next to the zoom (bottom right) gives the game a phone, tablet, laptop or custom size, to test the layout (and the Anchor component) at other resolutions. Games with a fixed canvas size keep their size. |
-| **Duplicate / Delete** | `Cmd/Ctrl+D` or ⧉ copies the object's code; `Delete` or 🗑 removes it (with a preview of the lines). See [Duplicating and deleting](#duplicating-and-deleting). |
-| **Create** | **+ Create** in the hierarchy: Container, Sprite (pick one of the textures the game has loaded), Text, Rectangle or Circle; and HTML (Panel, Button, Input, Text). See [Creating objects](#creating-objects). |
-| **Components** | "Add component…" in the inspector: **Anchor**, **Button**, **Tween**, or your own **behaviors** (see below). |
-| **Code** | Every line that controls the selected object is listed in the inspector; **Open ↗** (or double-click) opens it in VS Code at that line. |
-| **Save** | `Cmd/Ctrl+S` opens **Review changes**: every change (with **Discard**) and the exact lines that will change in each file. Enter saves. Untick "Review before saving" to save directly. Undo `Cmd/Ctrl+Z`, redo `Cmd/Ctrl+Shift+Z`. |
-| **Quit** | The **Quit** button stops the editor process cleanly (closes the project's Vite and frees the ports). Ctrl+C in the terminal does the same. If an old editor is still running on the port, a new launch closes it first. |
+| **Select** | Click the top-most object. `Alt`+click cycles through whatever is stacked under the pointer. |
+| **Move (V)** | Drag to move (`Shift` locks an axis), corner handles scale, the handle above rotates. Arrow keys nudge by 1 px, `Shift` by 10. |
+| **Pivot (P)** | Drag to place the object's origin (`anchor` for sprites and text, `pivot` for the rest). The object stays put while its origin moves. |
+| **Zoom / pan** | Wheel or pinch to zoom around the pointer, `Space`+drag to pan, `F` to fit, `0` to reset. |
 
-## Creating objects
+### The inspector
 
-Select a container (or any object inside it) and use **+ Create** in the hierarchy. The new object
-appears in the middle of the view, selected, and its code is written right away, in the same function
-that builds the container, after the last line that sets it up (never inside event handlers or
-update functions, and before any `return`):
+Select an object and the inspector fills in: its transform, its appearance, the components
+on it, and **every line of code that controls it**, each with the file, the line number and an
+*Open* button that jumps there in VS Code (or `PIXI_EDITOR_IDE=cursor`, etc.).
 
-```ts
-import { Container, Graphics, Text, Sprite } from "pixi.js"; // import extended when needed
-// …
-leaderboard.position.set(0, 100);
-const coin = Sprite.from("coin");
-coin.anchor.set(0.5);
-coin.position.set(480, 172);
-leaderboard.addChild(coin);
-```
+![The inspector showing a sprite's transform, its texture and tint, and the exact source lines that set each value](docs/images/inspector.png)
 
-From then on it is a normal object: move, rename, recolor or add components to it and save as usual.
-The container must be stored in a variable in the code. Variable names never clash with existing
-ones (`label`, `label2`…), and the project's quote style and Prettier formatting are respected.
+Drag a field's label to scrub the value, the way you would in Unity. Text objects expose font,
+size, weight, style, alignment and spacing; sprites expose their texture (with a picker of
+everything the game has loaded) and tint; spines expose their skeleton and a live animation
+preview.
 
-**HTML objects** (Panel, Button, Input, Text) are real HTML inside the scene, with Pixi's
-`DOMContainer`: they move, scale, rotate and fade with their container, and follow the canvas when it
-is resized. Use them for name fields, forms and anything that needs the browser's text input. The
-editor writes the element and its starting style, one line each:
+### Scene tree and project files
 
-```ts
-const input = new DOMContainer({ element: document.createElement("input"), anchor: 0.5 });
-input.element.placeholder = "Type here";
-input.element.style.fontSize = "18px";
-input.position.set(480, 270);
-ui.addChild(input);
-```
+The hierarchy mirrors the live scene. A pink dot means the object is linked to a line of code.
+**+ Create** adds a Container, Sprite, Text, Rectangle, Circle, or an HTML Panel / Button /
+Input / Text, and writes the code for it right away.
 
-Select one (in the hierarchy or by clicking it) to move it like any object; its inspector also shows
-the element's text, properties and style (see [HTML on top of the canvas](#html-on-top-of-the-canvas)
-for how they are saved). A style without a line gets one after the container's code
-(`input.element.style.color = "#fff";`). Things to know: `DOMContainer` is marked experimental by
-Pixi; HTML is always drawn above the canvas (draw order only matters among HTML objects); filters
-and masks don't apply to it. The menu shows HTML only when the project's pixi.js has `DOMContainer`.
+![The scene tree with the Create menu open, and the project file browser below it](docs/images/scene-tree.png)
 
-## Previewing files
+Below the tree, the **Project** panel browses the repo (minus `node_modules` and friends).
+Click a file to preview it in the inspector: source with syntax highlighting, images on a
+checker background, sounds with a scrubbable waveform, and spine skeletons playing their
+animations. Double-click to open it in your editor.
 
-Click a file in **Project** and the inspector shows it:
+## Saving rewrites your source
 
-- **Code and text** (`.ts`, `.js`, `.json`, `.atlas`, `.fnt`, `.md`…): colored, with line numbers.
-  Double-click a line to open the file at that line. Minified JSON gets a **Format** button.
-- **Images**: full size or fitted, on a checker, dark or light background, with their dimensions.
-- **Sounds**: player with waveform (click to seek), loop and volume. Space plays/pauses.
-- **Spine**: select the `.atlas` (or the skeleton `.json`/`.skel` next to it) to see the skeleton
-  animated. Click an animation to play it; pause, loop, speed (0.25×–2×), skins and background. It uses
-  the game's own Pixi and Spine runtime, and the files the game already loaded when possible.
+Press `Cmd/Ctrl+S` and the **Review changes** dialog shows exactly what will change, grouped
+by file, with the before/after lines side by side. Accept it and only those lines move.
 
-Selecting an object in the scene or the hierarchy brings the object inspector back. Widen the
-inspector (drag its left edge) to read long lines.
+![The review dialog showing a position change as a before/after source diff](docs/images/review.png)
 
-## Text style and spine animation
+Here is what happens under the hood. While the game runs inside the editor, its code is
+instrumented *in memory* (never on disk) to record which line set each property of each
+object. On save, the editor adjusts the number on that line and keeps the expression around
+it: `22` becomes `40`, `app.renderer.width - 10` becomes `app.renderer.width - 24`,
+`someVar` becomes `someVar + 5`. Text, names and colors replace the literal in place. If a
+value is computed by code (`i18n.t(...)`, a template string), the editor won't overwrite it;
+it says so and reverts the preview instead of guessing.
 
-Texts show **Font, Size, Weight, Style, Align and Spacing**. They are saved where the code defines
-them — `style: { fontSize: 24 }` → `30`, `createText({ fontSize: 40 })` → `46` — or, for an object
-with a variable and no such line, as `scoreText.style.align = "center";` after its creation. A style
-shared through a variable (`style: titleStyle`) is not changed from one object.
+Files that were already Prettier-clean are reformatted after the save, so your lint stays
+green. Files your team never formatted are left untouched.
 
-Spines show an **Animation** menu with the skeleton's animations; the chosen one plays in a loop while
-you edit. On save, the animation name is written where the code chooses it:
-`spine.state.setAnimation(0, "idle", true)` or `createSpineAnimation({ animationName: "idle" })`.
+A few things it deliberately won't do:
 
-## HTML on top of the canvas
+- A line inside a loop or a shared helper affects **every** object it builds, so the inspector
+  warns when a change touches more than one object.
+- Objects with no variable of their own (`world.addChild(new Sprite())`) can be moved to try
+  things out, but there is no line to save them to.
+- Code that sets a position every frame will snap the object back while you edit. Your saved
+  change still applies.
 
-Many games draw menus and forms with HTML (a name screen, a login form) on top of the canvas. They are
-listed under **Page (HTML)** in the hierarchy and selected like any object; a click in the viewport
-picks the HTML first, since it is drawn above the canvas.
+## It fits how your team writes code
 
-The inspector shows the element's **Text**, its tag's properties (placeholder, value and type for
-inputs, src for images…) and its **inline style**, one row per property. Type a value and press Enter;
-arrow keys change numbers and keep the unit (`1.5em` → `1.6em`, Shift ×10). **Add** adds a style
-property. A pink dot next to a name means a line of code already sets it.
-
-**Moving and resizing.** Drag a selected element to move it, or use the arrow keys (1px, Shift 10px);
-drag its corners to resize it. Loose HTML is placed by CSS, so this changes CSS:
-
-- Moving changes `left`/`top`, or `right`/`bottom` when that is the edge that holds the element
-  (a menu at `right: 16px` stays anchored to the right). It needs `position: absolute`, `fixed` or
-  `relative`; an element placed by its parent (in a flex column, for example) can't be dragged: the
-  status bar says so, and it can still be resized from its corner.
-- Resizing changes `width`/`height`. From a left or top corner, the opposite edge stays in place.
-- Values keep their unit: `10%` stays a percentage of the containing box, `100vw` becomes `78.49vw`,
-  `1.5em` stays in em. A value that wasn't set (`auto`) is written in px; one written with `calc()`
-  or `var()` is left as is. Small elements show no corners (they would block moving them).
-
-**CSS rules.** Below the inline style, the inspector lists the CSS rules that apply to the element
-(from the project's CSS files, most specific first, `@media` included), each with its file and line.
-Edit a value or **Add** a property to a rule: the change is live for every element the rule applies
-to (the inspector says how many), and saving rewrites the declaration in the CSS file, keeping its
-layout. Dragging or resizing an element whose position or size comes from a rule changes that rule,
-not the element's inline style.
-
-**HTML templates.** HTML written in a string — `mount.innerHTML = \`<section class="panel">…\``,
-`outerHTML`, `insertAdjacentHTML(…)`, and templates nested in their `${…}` (like `.map(…)`) — is
-linked too: each tag's fixed attributes, text and inline style are saved back into the template,
-escaped for its string. Parts written with `${…}` are computed by code: they are shown, never
-overwritten. A tag inside `.map()` makes several elements; the inspector warns that a change
-applies to all of them.
-
-On save:
-
-- Elements made with `document.createElement` are saved on the lines that set them —
-  `el.style.fontSize = "1.5em"`, `el.style.setProperty("color", …)`, `Object.assign(el.style, { … })`,
-  `el.placeholder = "…"`, `el.setAttribute("maxlength", "20")`, `el.textContent = "…"` — keeping the
-  literal's kind (string, number, quotes). A property without a line gets one after the element's
-  creation: `playBtn.style.color = "#ff0000";`.
-- Elements written in **index.html** are saved there: style declarations, attributes and text are
-  replaced in place, new ones are added to the tag (`style="…; font-size: 14px"`). Vite reloads the page
-  after an HTML change; the editor comes back to Edit mode on the same element.
-- Values computed by code (`` `${size}px` ``) are not overwritten. Elements built by libraries or
-  with DOM calls the editor doesn't follow are shown but not saved. The editor's **eye** only hides an
-  element while editing.
-
-## Duplicating and deleting
-
-**Duplicate** (`Cmd/Ctrl+D`) copies the object's code right after the original — its declaration and
-the lines next to it that set it up — with a new variable name, and adds the copy wherever the
-original is listed:
+Not every project calls `new Sprite()`. Many build objects through helpers, and the editor
+treats those as the object's creation point:
 
 ```ts
-const coin = Sprite.from("coin");        const coin2 = Sprite.from("coin");
-coin.anchor.set(0.5);              ->     coin2.anchor.set(0.5);
-hud.addChild(coin);                       hud.addChild(coin2);
-createContainer({ children: [coin] })     createContainer({ children: [coin, coin2] })
+createSprite({ texture: TEX.BACKGROUND, parent: balanceGroup, anchor: 0.5, position: [178, -25] });
 ```
 
-The copy appears on top of the original, selected, ready to be dragged. Save the original's changes
-first. Containers whose children are added in the code are not duplicated (duplicate the children).
+It names the object after its label, text or texture, edits the values inside the options
+object (`position: [178 + 20, -25]`), and adds a property to the call when the project already
+uses that helper with that key elsewhere. Function names matching `create…`, `make…` or
+`build…` are recognized out of the box. Constants are followed too, so changing a sprite's
+texture rewrites `TEX.HUD.COIN` to `TEX.HUD.GEM` rather than inlining a string.
 
-**Delete** (`Delete` key) shows the lines that will be removed and asks first. It removes the
-declaration, every line that uses the object as its subject (`coin.x = …`, `coin.on(…)`,
-`hud.addChild(coin)`, `addComponent(coin, …)`), its entry in `children: [...]` lists, and imports that
-become unused. If other code still needs the object (`return { coin }`, `if (coin.visible)`,
-`foo(coin)`), nothing is deleted and the editor shows those lines.
+Structural edits work the same way. **Duplicate** copies the object's setup lines with a fresh
+variable name; **Delete** removes the declaration and every line that used it, including its
+entry in `children: [...]` arrays and any import that goes unused. Reparenting and reordering
+rewrite the `addChild` call or the `children` list and adjust the position so the object stays
+where it was on screen. If something else in the code still needs the object, the edit is
+refused and the offending lines are shown.
 
-## Draw order
+## HTML and CSS over the canvas
 
-Drag an object onto the top or bottom edge of another one in the hierarchy. On save, the line that
-adds it moves (`hud.addChild(a)` after `hud.addChild(b)`, or `children: [b, a]`). When that line
-can't move because it would use a variable before it's declared, the neighbour's line moves
-instead; if neither works, the editor says why and puts the order back.
+Plenty of games draw their menus, name screens and login forms with the DOM on top of the
+canvas. Those elements show up under **Page (HTML)** in the hierarchy and select like any other
+object. Drag one to move it and the editor edits its CSS: `left`/`top`, or `right`/`bottom`
+when that is the edge holding it, so a menu pinned to `right: 16px` stays pinned. Units are
+preserved (`%`, `vw`, `em`), and the inspector lists both the element's inline style and the
+CSS rules that apply to it, each with its file and line.
 
-## Lines inside pointer handlers
+HTML written as a string (`mount.innerHTML = \`<section class="panel">…\``) is linked too: the
+fixed parts of each tag are saved back into the template, while anything built from `${…}` is
+shown but never overwritten.
 
-Lines inside hover/press handlers (`events: { pointerover: … }`, `obj.on("pointerdown", …)`) are
-marked **on pointer** in the inspector. They never replace the object's setup line: dragging a button
-after hovering it in Play mode still changes its normal position and texture, not the hover state.
+For Pixi-native HTML, **Create → HTML** writes real elements wrapped in Pixi's `DOMContainer`,
+so they move, scale and fade with their container like any display object.
 
-## Changing the parent, the texture or the spine
+## Components and behaviors
 
-**Parent.** Drag an object in the hierarchy onto another container. On save, the line that adds it is
-changed, and its position is adjusted so it stays where it was:
+The inspector's **Add component…** menu attaches small, reusable pieces of behavior, written
+into the project as plain code:
+
+| Component | What it does |
+|---|---|
+| **Anchor** (layout) | Keeps the object a fixed offset from a screen edge or corner, and follows resizes. |
+| **Button** (ui) | Pointer cursor plus hover/press scale feedback; you handle the click in code. |
+| **Tween** (animation) | A looping idle animation (pulse, float, spin, fade) on top of the object's values. |
+
+Components live in `src/pixi-components/`, one file per component, grouped by category. Only
+the categories a project actually uses are copied in, and each category's `index.ts` only
+re-exports, so unused components stay out of the build. The files are strict TypeScript,
+formatted with your Prettier, and safe to edit and commit; the editor never overwrites them.
+
+Need something custom? **New behavior…** creates a class for the selected object and opens it
+in your editor. It is attached in the code immediately, so it keeps working after a reload:
 
 ```ts
-ui.addChild(hintText);                          ->  leaderboard.addChild(hintText);
-createSprite({ parent: balanceGroup, … })       ->  createSprite({ parent: hudGroup, … })
-createContainer({ children: [a, b] })           ->  createContainer({ children: [a] });
-                                                    group.addChild(b);
-```
-
-The new parent must be stored in a variable that exists where the object is added (same function,
-declared before). Otherwise the editor says so and moves the object back.
-
-**Texture.** Select a sprite → Appearance → Texture → **Change…** and pick one of the textures the
-game has loaded. The code keeps its style: `"coin.png"` → `"gem.png"`, `Texture.from("coin")` →
-`Texture.from("gem")`, and when the project uses constants, `TEX.HUD.COIN` → `TEX.HUD.GEM` (the
-editor finds the constant whose value is that texture's key).
-
-**Spine.** Select a spine → Appearance → Spine → **Change…** and pick a loaded skeleton (paired with
-the atlas of the same name). The preview plays the same animation if the new skeleton has it, and
-warns you if it doesn't (the code that plays it will need another name). On save,
-`SPINES.JP_BAR.SKEL` / `SPINES.JP_BAR.ATLAS` become `SPINES.DRACULA.SKEL` / `SPINES.DRACULA.ATLAS`,
-and the game reloads by itself to run with it. A spine chosen by an expression
-(`SPINES[options.key].SKEL`) can't be changed from the editor — the inspector says so.
-
-## Components
-
-Components add reusable behaviour to any object, from the inspector ("Add component…", grouped by
-category):
-
-| Category · Component | What it does | Params |
-|---|---|---|
-| Layout · **Anchor** | Keeps the object at a fixed offset from a screen edge or corner (follows screen resizes). Dragging an anchored object edits its offset. | `h` left/center/right, `v` top/middle/bottom, `x`, `y` |
-| UI · **Button** | Pointer cursor plus hover/press scale feedback. Handle clicks in code: `obj.on("pointertap", …)`. | `hoverScale`, `pressScale`, `cursor` |
-| Animation · **Tween** | Looping idle animation on top of the object's values (paused in Edit mode). | `kind` pulse/float/spin/fade, `amount`, `speed` |
-
-On save, components are written as plain code right after the object is created, with one import
-per category (kept in sync):
-
-```ts
-import { addComponent } from "../pixi-components/core";
-import { Anchor } from "../pixi-components/layout";
-// …
-addComponent(netText, Anchor, { h: "right", v: "top", x: -30, y: 10 });
-```
-
-The components live in the project, one file each, grouped by category:
-
-```
-src/pixi-components/
-  core.ts            Component, addComponent, getComponent, removeComponent, useApp…
-  layout/            index.ts + Anchor.ts
-  ui/                index.ts + Button.ts
-  animation/         index.ts + Tween.ts
-```
-
-`core.ts` and a category's folder are added the first time one of its components is saved — a project
-that only uses Anchor gets `core.ts` and `layout/` only. The files are strict TypeScript, formatted
-with the project's Prettier, safe to edit and commit; the editor never overwrites them. Unused
-components are left out of the game's build (each category's `index.ts` only re-exports). For Anchor,
-a `useApp(app);` line is also added after the Application is created. Removing a component deletes
-its line (and the import when nothing else uses it).
-
-**Projects from older versions** have a single `src/pixi-components.ts`. The inspector shows
-**Migrate…**: it previews and rewrites every import of that file (`{ addComponent, Button } from
-"./pixi-components"` → core + ui), adds the folders in use and removes the old file — or keeps it as
-`pixi-components.ts.legacy` if it had changes of yours.
-
-**Adding a built-in component** (for editor developers): add its file to a category folder in
-`templates/pixi-components/` (or a new folder), export it from that folder's `index.ts`, and describe
-its fields in `templates/components-catalog.json`. The editor's menu and inspector are built from that
-catalog.
-
-## Behaviors (your own code per object)
-
-"Add component… → New behavior…" creates a class for the selected object and opens it in VS Code:
-
-```ts
-// src/behaviors/CoinSpinner.ts
 export class CoinSpinner extends Component {
   static readonly componentName = "CoinSpinner";
-  static readonly defaults = {};
 
   attach(): void {
     this.target.eventMode = "static";
@@ -325,110 +219,51 @@ export class CoinSpinner extends Component {
   }
 
   update(): void {
-    if (isEditorPaused()) return; // stay still while the editor is in Edit mode
+    if (isEditorPaused()) return; // hold still while the editor is paused
     this.target.rotation += 0.02;
   }
 }
 ```
 
-It is attached in the code right away (`addComponent(coin, CoinSpinner, {});` plus imports), so
-it keeps working when the game reloads after you save the behavior in VS Code. Existing behaviors
-appear in the same menu and can be attached to other objects. `this.target` is the object.
-Behaviors need the object to be stored in a variable in the code.
-
-To use another editor instead of VS Code, start Pixi Editor with `PIXI_EDITOR_IDE=cursor`.
-
-## Projects that build objects with helper functions
-
-Many projects create objects through helpers instead of `new Sprite()`:
-
-```ts
-createSprite({ texture: TEX.BACKGROUND, parent: balanceGroup, anchor: 0.5, position: [178, -25] });
-```
-
-Calls to functions named `create…`, `make…` or `build…` are treated as the object's creation: the
-editor names the object after its `label`, text or texture (`BACKGROUND`), and edits the values in
-the call's options object (`position: [178 + 20, -25]`). A property the call doesn't have yet is
-added to its options when that helper is used with that key elsewhere in the project; otherwise the
-call is wrapped so the value still lives next to the object:
-
-```ts
-Object.assign(createText({ text: i18n.t('common.balance'), … }), { label: 'Balance title' });
-```
-
-## How saving works
-
-1. While the game runs inside the editor, its code is instrumented in memory (never on disk) to record
-   which line set each property of each object: `x.position.set(...)`, `x.x = ...`, `x.scale.set(...)`,
-   `x.rotation = ...`, `x.alpha = ...`, and the `const x = new Graphics()` line that created it.
-2. On save, only the number on that line is adjusted, keeping the expression:
-   `22` → `40`, `app.renderer.width - 10` → `app.renderer.width - 24`, `44 + i * 22` → `54 + i * 22`,
-   `someVar` → `someVar + 5`.
-3. If the property had no line (e.g. a `Graphics` that was never positioned), one is inserted right
-   after its creation: `hudBg.position.set(11, 6);`.
-4. Text, names and colors replace the literal in the code (`text: "Score: 0"` → `text: "Points: 0"`,
-   `.fill(0x000000)` → `.fill(0x223344)`, `fill: '#fff'` keeps its string style). If the value is
-   computed by code (`i18n.t(...)`, `` `Score: ${n}` ``), it is not overwritten: the editor says so
-   and reverts the preview.
-5. If a file was already formatted with the project's Prettier, it is formatted again after saving,
-   so `npm run lint` keeps passing. Files that weren't formatted are left alone.
-
-### Current limitations
-
-- A line inside a loop or a function called several times affects **every** object it creates.
-  The inspector warns about it ("This line affects N objects").
-- Objects without their own variable (e.g. `world.addChild(new Sprite())`) or created inside libraries
-  can be moved to try things out, but cannot be saved.
-- If the code sets a position every frame or on every network message, the object may snap back while
-  you edit. Saved changes still apply.
-- The project must use **Vite** and create the app with `new Application()` (anywhere — also
-  `new Application() as GameApp` or returned from a function).
-- Shape fill colors can be edited when the shape is drawn in the same expression that creates it
-  (`new Graphics().rect(…).fill(0xff0000)`).
-- Different X/Y scale cannot be saved onto `obj.scale = 2` (it can onto `obj.scale.set(2)`).
-
-## Layout
-
-```
-bin/pixi-editor.js   CLI
-PixiEditor.app       macOS launcher (Contents/MacOS/launcher is a bash script); pixi-editor.command
-scripts/             app-icon.svg (app icon + favicon source) and build-app-icon.js (npm run build:icon)
-src/server.js        Editor server: UI, project picker, hosts the project's Vite (same origin)
-src/plugin.js        Vite plugin: instruments code, injects the runtime, saves changes
-src/instrument.js    Parses code (Babel) and marks the code site of each property
-src/writeback.js     Computes text edits ("adjust only the number")
-src/runtime.js       Injected into the game: links objects to lines of code
-src/refactor.js      Deleting, duplicating and reordering an object's code
-src/html.js          The project's index.html: its elements' attributes, style and text, and saving them
-                     (also HTML written in innerHTML templates)
-src/css.js           The project's CSS files: rules and declarations, and saving them
-templates/           pixi-components/ (components, copied into projects by category),
-                     components-catalog.json (their inspector fields), behavior.ts, new-project/,
-                     html-kinds.json (what Create → HTML writes)
-editor/              UI (dependency-free HTML/CSS/JS)
-test/run.js          npm test (unit tests: instrumenting and rewriting code)
-test/e2e/run.js      npm run e2e (browser tests on the projects in test/fixtures)
-```
-
 ## Development
 
 ```bash
-npm install                      # also installs vite, pixi.js, prettier and playwright for the tests
+npm install                      # also pulls vite, pixi.js, prettier and playwright
 npx playwright install chromium  # once per machine, for the browser tests
-npm test                         # unit tests (a second)
-npm run e2e                      # browser tests (~30 s)
+npm test                         # unit tests: instrumenting and rewriting code (~1s)
+npm run e2e                      # browser tests against the fixtures in test/fixtures (~30s)
 ```
 
-`npm run e2e` copies the fixture projects in `test/fixtures` (`basic`: plain `new X()` code;
-`factory`: `createSprite({...})` helpers, `TEX` constants, Prettier with single quotes;
-`templates`: the UI as one `innerHTML` template styled by a CSS file) to
-`test/.tmp`, starts Pixi Editor on each one, drives it in Chromium and checks the code it writes:
-search, moving, text style, creating, HTML elements of the page (also from innerHTML templates and CSS rules), the review dialog, duplicate and delete, parent and draw order,
-textures, and that Prettier-clean files stay clean. `npm run e2e -- factory` runs only the scenarios
-whose name contains "factory"; `HEADED=1 npm run e2e` shows the browser.
+The end-to-end suite copies three fixture projects into `test/.tmp`, starts the editor on each
+one, drives it in Chromium and checks the exact code it writes. The fixtures cover the three
+styles the editor has to handle: `basic` (plain `new X()`), `factory` (`createSprite({...})`
+helpers and `TEX` constants) and `templates` (UI built from an `innerHTML` template and styled
+by a CSS file). Run a subset with `npm run e2e -- factory`, or watch it with `HEADED=1`.
 
-## Next steps
+## Project layout
 
-- Multi-selection and alignment tools.
-- More components (e.g. layout with `@pixi/layout`, sprite animation, sound on click).
-- Stroke and drop shadow for texts.
+```
+bin/pixi-editor.js   CLI entry point
+PixiEditor.app       macOS launcher (also pixi-editor.command)
+src/server.js        Editor server: UI, project picker, hosts the project's Vite
+src/plugin.js        Vite plugin: instruments code, injects the runtime, saves changes
+src/instrument.js    Parses code (Babel) and marks the code site of each property
+src/writeback.js     Computes the text edits ("adjust only the number")
+src/runtime.js       Injected into the game to link objects to lines of code
+src/refactor.js      Delete, duplicate and reorder an object's code
+src/html.js          index.html elements and innerHTML templates: read and write back
+src/css.js           Project CSS files: rules and declarations
+templates/           New-project scaffold and the component library
+editor/              The UI (dependency-free HTML/CSS/JS)
+test/                Unit tests (run.js) and browser tests (e2e/run.js)
+```
+
+## Roadmap
+
+- Multi-selection with alignment and distribution tools.
+- More components: `@pixi/layout`, sprite-sheet animation, sound on click.
+- Stroke and drop shadow for text.
+
+## License
+
+MIT
