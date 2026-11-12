@@ -95,6 +95,7 @@ become selectable.
 | | |
 |---|---|
 | **Select** | Click the top-most object. `Alt`+click cycles through whatever is stacked under the pointer. |
+| **Select many** | `Shift`/`Cmd`-click or drag a box to pick several objects, then move, scale, rotate and align them as a group, or edit the values they share (fields that differ read *Mixed*). |
 | **Move (V)** | Drag to move (`Shift` locks an axis), corner handles scale, the handle above rotates. Arrow keys nudge by 1 px, `Shift` by 10. |
 | **Pivot (P)** | Drag to place the object's origin (`anchor` for sprites and text, `pivot` for the rest). The object stays put while its origin moves. |
 | **Zoom / pan** | Wheel or pinch to zoom around the pointer, `Space`+drag to pan, `F` to fit, `0` to reset. |
@@ -116,7 +117,9 @@ preview.
 
 The hierarchy mirrors the live scene. A pink dot means the object is linked to a line of code.
 **+ Create** adds a Container, Sprite, Text, Rectangle, Circle, or an HTML Panel / Button /
-Input / Text, and writes the code for it right away.
+Input / Text, and writes the code for it right away. Each row has an eye to hide the object while
+editing, and a lock to stop it being picked in the scene — so a full-screen background or overlay
+stops swallowing clicks meant for things behind it. Both are editor-only and never saved.
 
 ![The scene tree with the Create menu open, and the project file browser below it](docs/images/scene-tree.png)
 
@@ -195,11 +198,24 @@ so they move, scale and fade with their container like any display object.
 The inspector's **Add component…** menu attaches small, reusable pieces of behavior, written
 into the project as plain code:
 
-| Component | What it does |
-|---|---|
-| **Anchor** (layout) | Keeps the object a fixed offset from a screen edge or corner, and follows resizes. |
-| **Button** (ui) | Pointer cursor plus hover/press scale feedback; you handle the click in code. |
-| **Tween** (animation) | A looping idle animation (pulse, float, spin, fade) on top of the object's values. |
+| Component | Category | What it does |
+|---|---|---|
+| **Anchor** | layout | Keeps the object a fixed offset from a screen edge or corner, through resizes. |
+| **Fit** | layout | Scales the object to fit (or cover) the screen as it resizes. |
+| **Button** | ui | Pointer cursor plus hover/press scale feedback; you handle the click in code. |
+| **Toggle** | ui | Turns the object into an on/off switch that dims when off. |
+| **Draggable** | ui | Lets the player drag the object with the pointer. |
+| **Tween** | animation | A looping idle animation (pulse, float, spin, fade) on top of the object's values. |
+| **Spin** | animation | Rotates the object continuously. |
+| **Orbit** | animation | Moves the object in a circle around its position. |
+| **Shake** | animation | Jitters the object around its position. |
+| **Appear** | animation | Plays a one-off entrance (fade, scale or rise) when the game starts. |
+| **FollowPointer** | animation | Eases the object toward the pointer every frame. |
+| **Blur** | effects | Applies a Gaussian blur filter, and stacks with other filters. |
+| **ColorAdjust** | effects | Brightness, saturation and a colour tint, via a colour-matrix filter. |
+
+Animation and effect components pause in Edit mode, so you can still position objects precisely;
+switch to Play to preview them.
 
 Components live in `src/pixi-components/`, one file per component, grouped by category. Only
 the categories a project actually uses are copied in, and each category's `index.ts` only
@@ -260,7 +276,7 @@ test/                Unit tests (run.js) and browser tests (e2e/run.js)
 
 ## Roadmap
 
-- Multi-selection with alignment and distribution tools.
+- Snapping and smart guides for moving and aligning objects.
 - More components: `@pixi/layout`, sprite-sheet animation, sound on click.
 - Stroke and drop shadow for text.
 

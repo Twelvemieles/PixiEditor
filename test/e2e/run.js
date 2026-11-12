@@ -964,6 +964,51 @@ const scenarios = [
     },
   },
   {
+    name: "components: new animation and effect components, boolean and colour fields",
+    fixture: "basic",
+    async run(ed, project) {
+      const page = ed.page;
+      const exists = (f) => fs.existsSync(path.join(project, f));
+      await ed.select("title");
+
+      const opts = await page.$$eval(".comp-add option", (o) => o.map((x) => x.value));
+      const added = ["Fit", "Toggle", "Draggable", "Spin", "Orbit", "Shake", "Appear", "FollowPointer", "Blur", "ColorAdjust"];
+      check(added.every((n) => opts.includes(n)), "the add menu lists every new component", opts.join(", "));
+      const groups = await page.$$eval(".comp-add optgroup", (g) => g.map((x) => x.label));
+      check(groups.includes("Effects"), "the Effects category appears in the menu", groups.join(", "));
+
+      // Spin (animation) + Toggle (a boolean field) on the title.
+      await page.selectOption(".comp-add", "Spin");
+      await page.waitForTimeout(300);
+      await page.selectOption(".comp-add", "Toggle");
+      await page.waitForTimeout(300);
+      check(await page.$('.comp[data-type="Toggle"] input[type="checkbox"][data-bool]'), "Toggle shows a boolean checkbox");
+
+      // ColorAdjust (an effect with a colour field) on the hint.
+      await ed.select("hint");
+      await page.selectOption(".comp-add", "ColorAdjust");
+      await page.waitForTimeout(300);
+      check(await page.$('.comp[data-type="ColorAdjust"] input[type="color"]'), "ColorAdjust shows a colour picker");
+      check(await page.$('.comp[data-type="ColorAdjust"] input[data-hex]'), "ColorAdjust shows a hex field");
+
+      await ed.save();
+      const hud = read(project, "src/hud.ts");
+      check(has(hud, 'import { Spin } from "./pixi-components/animation";'), "Spin imported from animation", hud.split("\n").slice(0, 8).join("\n"));
+      check(has(hud, 'import { Toggle } from "./pixi-components/ui";'), "Toggle imported from ui");
+      check(has(hud, 'import { ColorAdjust } from "./pixi-components/effects";'), "ColorAdjust imported from effects");
+      check(has(hud, "addComponent(title, Spin, {") && has(hud, "addComponent(title, Toggle, {") && has(hud, "addComponent(hint, ColorAdjust, {"), "the addComponent lines are written");
+      check(["animation/Spin.ts", "ui/Toggle.ts", "effects/ColorAdjust.ts", "effects/filter-stack.ts", "effects/index.ts"].every((f) => exists(`src/pixi-components/${f}`)), "the new component files are copied into the project");
+
+      // The boolean value round-trips: toggle the checkbox off and it saves as `on: false`.
+      await ed.select("title");
+      await page.waitForTimeout(200);
+      await page.click('.comp[data-type="Toggle"] input[type="checkbox"]');
+      await page.waitForTimeout(200);
+      await ed.save();
+      check(has(read(project, "src/hud.ts"), /addComponent\(title, Toggle, \{[^}]*on: false/), "editing the boolean field writes on: false", changed(hud, read(project, "src/hud.ts")));
+    },
+  },
+  {
     name: "components: migrate the old single file",
     fixture: "basic",
     async run(ed, project) {
@@ -997,6 +1042,153 @@ const scenarios = [
       await ed.select("title");
       await page.waitForTimeout(500);
       check(await page.$('.comp[data-type="Button"]') && !(await page.$(".legacy-note")), "after migrating, Button still works and the note is gone");
+    },
+  },
+  {
+    name: "basic: multi-selection — group move, align, bulk save",
+    fixture: "basic",
+    async run(ed, project) {
+      const before = read(project, "src/hud.ts");
+      const selectMany = (names) => ed.page.evaluate((names) => {
+        const pe = document.querySelector("#game").contentWindow.__PIXI_EDITOR__;
+        const found = {};
+        const walk = (o) => { for (const c of o.children) { const m = pe.meta(c); const n = (m && m.name) || c.label; if (n) found[n] = c; walk(c); } };
+        walk(pe.apps[0].stage);
+        const list = names.map((n) => found[n]).filter(Boolean);
+        window.pixiEditor.selectMany(list, list[list.length - 1]);
+        if (document.activeElement) document.activeElement.blur();
+        return window.pixiEditor.selection().length;
+      }, names);
+
+      check(await selectMany(["title", "hint"]) === 2, "selected title + hint");
+      check((await ed.page.textContent("#inspector .obj-name")).includes("2 objects"), "inspector shows '2 objects'");
+      check((await ed.page.$$("#inspector .align-btn")).length === 6, "the align tools are shown");
+      const mixed = await ed.page.evaluate(() => [...document.querySelectorAll("#inspector input[data-mprop]")].some((i) => i.placeholder === "Mixed"));
+      check(mixed, "fields that differ read 'Mixed'");
+
+      // Arrow keys move the whole group (title 20,20 and hint 20,52 → +10 x).
+      await ed.page.evaluate(() => document.querySelector("#overlay").focus());
+      await ed.key("Shift+ArrowRight");
+      const moved = await ed.page.evaluate(() => window.pixiEditor.selection().map((o) => Math.round(o.x)));
+      check(moved.every((x) => x === 30), "both objects moved to x=30", moved.join(", "));
+
+      const review = await ed.save();
+      check(review.changes.length === 2, "the review lists both objects", review.changes.join(", "));
+      const after = read(project, "src/hud.ts");
+      check(has(after, "title.position.set(30, 20);"), "title position written", changed(before, after));
+      check(has(after, "hint.position.set(30, 52);"), "hint position written", changed(before, after));
+
+      // Align left: the two objects end up sharing the same left edge.
+      await selectMany(["title", "hint"]);
+      await ed.page.click("#inspector .align-btn"); // first button = align left
+      await ed.page.waitForTimeout(150);
+      const lefts = await ed.page.evaluate(() => window.pixiEditor.selection().map((o) => Math.round(o.getBounds().minX)));
+      check(Math.abs(lefts[0] - lefts[1]) <= 2, "align-left matched the left edges", lefts.join(", "));
+    },
+  },
+  {
+    name: "basic: multi-selection — group scale and rotate with the gizmo",
+    fixture: "basic",
+    async run(ed, project) {
+      const selectMany = (names) => ed.page.evaluate((names) => {
+        const pe = document.querySelector("#game").contentWindow.__PIXI_EDITOR__;
+        const found = {};
+        const walk = (o) => { for (const c of o.children) { const m = pe.meta(c); const n = (m && m.name) || c.label; if (n) found[n] = c; walk(c); } };
+        walk(pe.apps[0].stage);
+        const list = names.map((n) => found[n]).filter(Boolean);
+        window.pixiEditor.selectMany(list, list[list.length - 1]);
+        if (document.activeElement) document.activeElement.blur();
+        return window.pixiEditor.selection().length;
+      }, names);
+      const xform = () => ed.page.evaluate(() => window.pixiEditor.selection().map((o) => ({ sx: o.scale.x, sy: o.scale.y, rot: o.rotation, x: o.x, y: o.y })));
+
+      check(await selectMany(["title", "hint"]) === 2, "selected title + hint");
+
+      // Pan the scene down so the HUD isn't at the very top (the rotate handle sits above the box).
+      const ob = await ed.page.evaluate(() => { const o = document.querySelector("#overlay").getBoundingClientRect(); return { left: o.left, top: o.top, cx: o.left + o.width / 2, cy: o.top + o.height / 2 }; });
+      await ed.page.keyboard.down("Space");
+      await ed.page.mouse.move(ob.cx, ob.cy);
+      await ed.page.mouse.down();
+      await ed.page.mouse.move(ob.cx, ob.cy + 160, { steps: 6 });
+      await ed.page.mouse.up();
+      await ed.page.keyboard.up("Space");
+
+      // Rotate the group a quarter-turn with the rotate handle (straight up → to the right).
+      const rg = await ed.page.evaluate(() => {
+        const r = window.pixiEditor.groupRect();
+        const o = document.querySelector("#overlay").getBoundingClientRect();
+        return { left: o.left, top: o.top, cx: r.x + r.w / 2, cy: r.y + r.h / 2, hy: r.y - 22 };
+      });
+      const rotBefore = await xform();
+      await ed.page.mouse.move(rg.left + rg.cx, rg.top + rg.hy);
+      await ed.page.mouse.down();
+      await ed.page.mouse.move(rg.left + rg.cx + (rg.cy - rg.hy), rg.top + rg.cy, { steps: 12 });
+      await ed.page.mouse.up();
+      const rotAfter = await xform();
+      check(rotAfter.every((s, i) => Math.abs(s.rot - rotBefore[i].rot) > 0.1), "both objects rotated", rotAfter.map((s) => s.rot.toFixed(2)).join(", "));
+
+      // Drag the SE corner of the group box outward so the pointer vector doubles → ~2× scale.
+      check(await selectMany(["title", "hint"]) === 2, "re-selected the pair");
+      const geom = await ed.page.evaluate(() => {
+        const r = window.pixiEditor.groupRect();
+        const o = document.querySelector("#overlay").getBoundingClientRect();
+        const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+        return { left: o.left, top: o.top, cx, cy, se: { x: r.x + r.w, y: r.y + r.h } };
+      });
+      const before = await xform();
+      await ed.page.mouse.move(geom.left + geom.se.x, geom.top + geom.se.y);
+      await ed.page.mouse.down();
+      // target = centre + 2×(corner - centre)
+      await ed.page.mouse.move(geom.left + geom.cx + 2 * (geom.se.x - geom.cx), geom.top + geom.cy + 2 * (geom.se.y - geom.cy), { steps: 10 });
+      await ed.page.mouse.up();
+      const scaled = await xform();
+      check(scaled.every((s, i) => Math.abs(s.sx - before[i].sx * 2) < 0.2), "both objects scaled ~2×", scaled.map((s) => s.sx.toFixed(2)).join(", "));
+      const spread = scaled.every((s, i) => Math.hypot(s.x - before[i].x, s.y - before[i].y) > 1);
+      check(spread, "scaling moved each object away from the group centre");
+
+      const review = await ed.save();
+      const names = new Set(review.changes.map((c) => c.split(" · ")[0]));
+      check(names.has("title") && names.has("hint"), "the save reviews both transformed objects", review.changes.join(", "));
+      const hud = read(project, "src/hud.ts");
+      check(has(hud, /title\.scale/), "a scale line was written for the title", hud);
+    },
+  },
+  {
+    name: "basic: lock — a locked object is skipped when picking in the scene",
+    fixture: "basic",
+    async run(ed, project) {
+      // The title sits on top of the panel; locking the title should let a click fall through to it.
+      const r = await ed.page.evaluate(() => {
+        const pe = document.querySelector("#game").contentWindow.__PIXI_EDITOR__;
+        const found = {};
+        const walk = (o) => { for (const c of o.children) { const m = pe.meta(c); const n = (m && m.name) || c.label; if (n) found[n] = c; walk(c); } };
+        walk(pe.apps[0].stage);
+        const title = found.title, panel = found.panel;
+        if (!title || !panel) return { ok: false, names: Object.keys(found) };
+        const b = title.getBounds();
+        const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+        const name = (o) => o ? ((pe.meta(o) || {}).name || o.label || o.constructor.name) : null;
+        const beforeLock = window.pixiEditor.pick(cx, cy) === title;
+        window.pixiEditor.setLocked(title, true);
+        const hit = window.pixiEditor.pick(cx, cy);
+        const lockedFlag = window.pixiEditor.isLocked(title);
+        const skipsTitle = hit !== title, hitsPanel = hit === panel;
+        window.pixiEditor.setLocked(title, false);
+        const afterUnlock = window.pixiEditor.pick(cx, cy) === title;
+        return { ok: true, beforeLock, lockedFlag, skipsTitle, hitsPanel, afterUnlock, hitName: name(hit) };
+      });
+      check(r.ok, "found the title and the panel behind it", JSON.stringify(r));
+      check(r.beforeLock, "unlocked: clicking the title picks it");
+      check(r.lockedFlag, "the title reports as locked");
+      check(r.skipsTitle, "locked: the title is no longer picked", `hit=${r.hitName}`);
+      check(r.hitsPanel, "locked: the click falls through to the panel behind it", `hit=${r.hitName}`);
+      check(r.afterUnlock, "unlocking restores picking the title");
+
+      // Every hierarchy row has a lock button, and clicking it marks the row (and shows the icon).
+      await ed.page.evaluate(() => { const l = document.querySelector("#tree .node .lock"); if (l) l.click(); });
+      await ed.page.waitForTimeout(120);
+      const marked = await ed.page.evaluate(() => !!document.querySelector("#tree .node.locked .lock.on"));
+      check(marked, "the hierarchy lock button marks a row locked");
     },
   },
 ];

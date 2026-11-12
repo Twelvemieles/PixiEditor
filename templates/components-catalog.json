@@ -15,6 +15,15 @@
             { "key": "y", "label": "Offset Y", "type": "number", "step": 1 }
           ],
           "needsApp": true
+        },
+        {
+          "name": "Fit",
+          "help": "Scales the object so it fits the screen, following resizes. Contain fits inside, cover fills it.",
+          "fields": [
+            { "key": "mode", "label": "Mode", "type": "select", "options": ["contain", "cover"] },
+            { "key": "padding", "label": "Padding", "type": "number", "step": 1 }
+          ],
+          "needsApp": true
         }
       ]
     },
@@ -30,6 +39,21 @@
             { "key": "pressScale", "label": "Press scale", "type": "number", "step": 0.01 },
             { "key": "cursor", "label": "Cursor", "type": "select", "options": ["pointer", "default", "grab", "help"] }
           ]
+        },
+        {
+          "name": "Toggle",
+          "help": "Turns the object into an on/off switch: tapping flips it and dims it when off. Listen with target.on(\"toggle\", …).",
+          "fields": [
+            { "key": "on", "label": "On", "type": "boolean" },
+            { "key": "offAlpha", "label": "Off opacity", "type": "number", "step": 0.05 }
+          ]
+        },
+        {
+          "name": "Draggable",
+          "help": "Lets the player grab and drag the object with the pointer. Disabled while the editor is paused.",
+          "fields": [
+            { "key": "axis", "label": "Axis", "type": "select", "options": ["both", "x", "y"] }
+          ]
         }
       ]
     },
@@ -44,6 +68,69 @@
             { "key": "kind", "label": "Kind", "type": "select", "options": ["pulse", "float", "spin", "fade"] },
             { "key": "amount", "label": "Amount", "type": "number", "step": 0.01 },
             { "key": "speed", "label": "Speed", "type": "number", "step": 0.05 }
+          ]
+        },
+        {
+          "name": "Spin",
+          "help": "Rotates the object continuously. Paused in Edit mode — switch to Play to preview.",
+          "fields": [
+            { "key": "speed", "label": "Turns / sec", "type": "number", "step": 0.05 }
+          ]
+        },
+        {
+          "name": "Orbit",
+          "help": "Moves the object in a circle around its position. Paused in Edit mode — switch to Play to preview.",
+          "fields": [
+            { "key": "radius", "label": "Radius", "type": "number", "step": 1 },
+            { "key": "speed", "label": "Turns / sec", "type": "number", "step": 0.05 }
+          ]
+        },
+        {
+          "name": "Shake",
+          "help": "Jitters the object around its position. Paused in Edit mode — switch to Play to preview.",
+          "fields": [
+            { "key": "amount", "label": "Amount", "type": "number", "step": 0.5 },
+            { "key": "speed", "label": "Shakes / sec", "type": "number", "step": 0.5 }
+          ]
+        },
+        {
+          "name": "Appear",
+          "help": "Plays a one-off entrance when the game starts. Shows the final state in Edit mode.",
+          "fields": [
+            { "key": "kind", "label": "Kind", "type": "select", "options": ["fade", "scale", "rise"] },
+            { "key": "duration", "label": "Duration", "type": "number", "step": 0.05 },
+            { "key": "distance", "label": "Rise distance", "type": "number", "step": 1 }
+          ]
+        },
+        {
+          "name": "FollowPointer",
+          "help": "Eases the object toward the pointer every frame. Paused in Edit mode.",
+          "fields": [
+            { "key": "ease", "label": "Ease", "type": "number", "step": 0.01 }
+          ],
+          "needsApp": true
+        }
+      ]
+    },
+    {
+      "id": "effects",
+      "label": "Effects",
+      "components": [
+        {
+          "name": "Blur",
+          "help": "Applies a Gaussian blur to the object. Stacks with other filter components.",
+          "fields": [
+            { "key": "strength", "label": "Strength", "type": "number", "step": 0.5 },
+            { "key": "quality", "label": "Quality", "type": "number", "step": 1 }
+          ]
+        },
+        {
+          "name": "ColorAdjust",
+          "help": "Adjusts brightness, saturation and tint with a colour-matrix filter. Stacks with other filters.",
+          "fields": [
+            { "key": "brightness", "label": "Brightness", "type": "number", "step": 0.05 },
+            { "key": "saturation", "label": "Saturation", "type": "number", "step": 0.05 },
+            { "key": "tint", "label": "Tint", "type": "color" }
           ]
         }
       ]

@@ -338,7 +338,13 @@ export function serializeParams(params) {
   return parts.length ? `{ ${parts.join(", ")} }` : "{}";
 }
 
-export const COMPONENT_EXPORTS = ["addComponent", "useApp", "Anchor", "Button", "Tween"];
+export const COMPONENT_EXPORTS = [
+  "addComponent", "useApp",
+  "Anchor", "Fit",
+  "Button", "Toggle", "Draggable",
+  "Tween", "Spin", "Orbit", "Shake", "Appear", "FollowPointer",
+  "Blur", "ColorAdjust",
+];
 
 /**
  * Computes the edit that makes `code` import exactly the component names it uses

@@ -67,9 +67,14 @@ export function useApp(app: Application): void {
   state.app = app;
 }
 
+/** The Application components should use, or null before one is registered with `useApp`. */
+export function getApp(): Application | null {
+  return state.app ?? g.__PIXI_APP__ ?? null;
+}
+
 /** Current screen size, or null before the Application is initialised. */
 export function getScreen(): { width: number; height: number } | null {
-  const app = state.app ?? g.__PIXI_APP__ ?? null;
+  const app = getApp();
   return app && app.renderer ? app.screen : null;
 }
 

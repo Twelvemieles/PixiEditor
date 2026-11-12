@@ -13,6 +13,8 @@ const state = {
   win: null, pe: null, app: null,
   mode: "edit",
   selected: null, hover: null,
+  selection: [], // all selected Pixi objects; state.selected is the primary (last) one
+  lastTreeClick: null, // for Shift range-select in the hierarchy
   domSelected: null, // an HTML element of the game's page (shown read-only)
   pending: new Map(), // key -> { obj, prop, original, current }
   undo: [], redo: [],
@@ -254,6 +256,8 @@ iframe.addEventListener("load", () => {
   state.win = state.pe = state.app = null;
   state.mode = "play"; // let the game boot (loading screens, tweens…); switch to Edit when ready
   state.selected = state.hover = state.domSelected = null;
+  state.selection = []; state.lastTreeClick = null;
+  locked = new WeakSet();
   state.pending.clear(); state.undo = []; state.redo = [];
   state.compOriginal.clear(); state.compMod = null;
   state.info.clear();
@@ -431,6 +435,25 @@ function domContainerBounds(o) {
   return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) };
 }
 
+// ---------------------------------------------------------------- locking (editor-only)
+// An object locked in the hierarchy can't be picked in the scene, so a full-screen background or
+// an overlay stops swallowing clicks meant for things behind it. Locks live only in the editor
+// (never written to the project) and clear when the project reloads. They apply to the whole
+// subtree, and work the same for the page's HTML elements.
+let locked = new WeakSet();
+const isLockedSelf = (o) => !!o && locked.has(o);
+function isLocked(o) {
+  if (!o) return false;
+  if (locked.has(o)) return true;
+  if (isDom(o)) { for (let el = o.parentElement; el; el = el.parentElement) if (locked.has(el)) return true; return false; }
+  for (let p = o.parent; p && state.app && p !== state.app.stage; p = p.parent) if (locked.has(p)) return true;
+  return false;
+}
+function toggleLocked(o) {
+  if (!o) return;
+  locked.has(o) ? locked.delete(o) : locked.add(o);
+}
+
 /** Every object under the point, top-most first (each resolved to its editable ancestor). */
 function pickAll(gx, gy) {
   const stage = state.app.stage;
@@ -439,7 +462,7 @@ function pickAll(gx, gy) {
     const kids = o.children || [];
     for (let i = kids.length - 1; i >= 0; i--) {
       const c = kids[i];
-      if (!c.visible || c.alpha === 0) continue;
+      if (!c.visible || c.alpha === 0 || locked.has(c)) continue;
       visit(c);
       if (c.children.length === 0) {
         const b = boundsOf(c);
@@ -447,7 +470,7 @@ function pickAll(gx, gy) {
           let t = c;
           while (t && t !== stage && !isEditable(t)) t = t.parent;
           const r = t && t !== stage ? t : c;
-          if (!out.includes(r)) out.push(r);
+          if (!out.includes(r) && !isLocked(r)) out.push(r);
         }
       }
     }
@@ -462,7 +485,7 @@ function pick(gx, gy) {
     const kids = o.children || [];
     for (let i = kids.length - 1; i >= 0; i--) {
       const c = kids[i];
-      if (!c.visible || c.alpha === 0) continue;
+      if (!c.visible || c.alpha === 0 || locked.has(c)) continue;
       const hit = visit(c);
       if (hit) return hit;
       if (c.children.length === 0) {
@@ -1105,6 +1128,15 @@ function handleAt(pt) {
     for (const h of domHandles(r, domLayout(del).movable)) if (Math.abs(pt.x - h.x) <= 7 && Math.abs(pt.y - h.y) <= 7) return { ...h, dom: true };
     return null;
   }
+  if (multiSel()) {
+    // Group gizmo: scale/rotate the whole selection around its shared centre.
+    if (state.tool !== "move") return null;
+    const gr = selectionOverlayRect();
+    if (!gr) return null;
+    const hs = handlesOf(gr);
+    for (const h of [hs.rotate, ...hs.corners]) if (Math.abs(pt.x - h.x) <= 7 && Math.abs(pt.y - h.y) <= 7) return { ...h, group: true };
+    return null;
+  }
   const sel = state.selected;
   if (!sel || sel.destroyed || state.mode !== "edit") return null;
   const r = rectOf(sel);
@@ -1122,6 +1154,30 @@ function handleAt(pt) {
 function originOf(o) {
   const gp = o.getGlobalPosition();
   return globalToOverlay(gp.x, gp.y);
+}
+/** Union of the selected objects' outline rects, in overlay pixels (null if none measurable). */
+function selectionOverlayRect() {
+  let box = null;
+  for (const o of selList()) {
+    const r = rectOf(o);
+    if (!r) continue;
+    box = box
+      ? { x: Math.min(box.x, r.x), y: Math.min(box.y, r.y), x2: Math.max(box.x2, r.x + r.w), y2: Math.max(box.y2, r.y + r.h) }
+      : { x: r.x, y: r.y, x2: r.x + r.w, y2: r.y + r.h };
+  }
+  return box ? { x: box.x, y: box.y, w: box.x2 - box.x, h: box.y2 - box.y } : null;
+}
+/** Union of the selected objects' global bounds (used by the alignment tools). */
+function selectionGlobalBounds() {
+  let box = null;
+  for (const o of selList()) {
+    const b = boundsOf(o);
+    if (!b) continue;
+    box = box
+      ? { minX: Math.min(box.minX, b.minX), minY: Math.min(box.minY, b.minY), maxX: Math.max(box.maxX, b.maxX), maxY: Math.max(box.maxY, b.maxY) }
+      : { ...b };
+  }
+  return box;
 }
 /** Dashed line from the anchored screen edge to the object. */
 function drawAnchorGuide(o) {
@@ -1165,8 +1221,46 @@ function draw() {
       ctx.setLineDash([]);
     }
   }
+  // Multi-selection: outline every selected object (the primary a touch brighter) and a group box.
+  if (multiSel()) {
+    for (const o of selList()) {
+      const r = rectOf(o);
+      if (!r) continue;
+      ctx.strokeStyle = o === state.selected ? "#ff4f8b" : "rgba(255,79,139,0.7)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+    }
+    const gr = selectionOverlayRect();
+    if (gr) {
+      ctx.strokeStyle = "rgba(255,79,139,0.5)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(gr.x + 0.5, gr.y + 0.5, gr.w, gr.h);
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(20,22,26,0.92)";
+      ctx.font = "11px ui-monospace, Menlo, monospace";
+      const label = `${selList().length} selected`;
+      const w = ctx.measureText(label).width + 10;
+      const ly = gr.y - 18 < 2 ? gr.y + gr.h + 4 : gr.y - 18;
+      ctx.fillRect(gr.x, ly, w, 16);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(label, gr.x + 5, ly + 12);
+      // Scale corners + rotate handle for the whole group (move tool only).
+      if (state.tool === "move") {
+        const hs = handlesOf(gr);
+        ctx.strokeStyle = "#ff4f8b"; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(hs.rotate.x, gr.y); ctx.lineTo(hs.rotate.x, hs.rotate.y + 5); ctx.stroke();
+        for (const h of hs.corners) {
+          ctx.fillStyle = "#fff"; ctx.fillRect(h.x - 4, h.y - 4, 8, 8);
+          ctx.strokeStyle = "#ff4f8b"; ctx.strokeRect(h.x - 4 + 0.5, h.y - 4 + 0.5, 7, 7);
+        }
+        ctx.beginPath(); ctx.arc(hs.rotate.x, hs.rotate.y, 5, 0, Math.PI * 2);
+        ctx.fillStyle = "#fff"; ctx.fill(); ctx.strokeStyle = "#ff4f8b"; ctx.stroke();
+      }
+    }
+  }
   const sel = state.selected;
-  if (sel && !sel.destroyed) {
+  if (sel && !sel.destroyed && !multiSel()) {
     const r = rectOf(sel);
     if (r) {
       ctx.strokeStyle = "#ff4f8b";
@@ -1249,8 +1343,56 @@ function draw() {
     ctx.stroke();
     ctx.setLineDash([]);
   }
+  if (state.drag && state.drag.type === "marquee" && state.drag.moved) {
+    const r = normRect(state.drag.startPt, state.drag.cur);
+    ctx.fillStyle = "rgba(96,165,250,0.12)";
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = "rgba(96,165,250,0.9)";
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w, r.h);
+    ctx.setLineDash([]);
+  }
 }
 requestAnimationFrame(draw);
+
+// ---------------------------------------------------------------- marquee / group helpers
+const normRect = (a, b) => ({ x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) });
+const rectsIntersect = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+/** Editable objects whose outline overlaps the marquee rect (overlay pixels); picks the top-most. */
+function objectsInOverlayRect(rect) {
+  const out = [];
+  (function walk(o) {
+    for (const c of o.children) {
+      if (!c.visible) continue;
+      if (isEditable(c)) {
+        const r = rectOf(c);
+        if (r && rectsIntersect(r, rect)) { if (!out.includes(c)) out.push(c); continue; }
+      }
+      walk(c);
+    }
+  })(state.app.stage);
+  return out;
+}
+/** Starts a move drag that carries the whole selection when the pressed object is part of it. */
+function startMoveDrag(primary, pt, clickPick = null) {
+  const objs = (isSelected(primary) && multiSel() ? selList() : [primary]).filter((o) => o.parent);
+  const befores = new Map(objs.map((o) => [o, readVals(o, ["x", "y"])]));
+  const compBefores = new Map(objs.map((o) => [o, compSnapshot(o)]));
+  return { type: "move", objs, primary, befores, compBefores, startPt: pt, moved: false, axis: null, clickPick,
+    before: befores.get(primary), compBefore: compBefores.get(primary) };
+}
+/** Starts a group scale or rotate drag: all selected objects transform around the selection centre. */
+function startGroupTransform(h, pt) {
+  const objs = selList().filter((o) => o.parent);
+  const gr = selectionOverlayRect();
+  const origin = { x: gr.x + gr.w / 2, y: gr.y + gr.h / 2 }; // selection centre, overlay pixels
+  const pivotG = overlayToGlobal(origin.x, origin.y); // same point in the game's global space
+  const befores = new Map(objs.map((o) => {
+    const gp = o.getGlobalPosition();
+    return [o, { gp: { x: gp.x, y: gp.y }, x: o.x, y: o.y, scaleX: o.scale.x, scaleY: o.scale.y, rotation: o.rotation, comp: compSnapshot(o) }];
+  }));
+  return { type: h.id === "rotate" ? "group-rotate" : "group-scale", objs, origin, pivotG, startPt: pt, moved: false, befores };
+}
 
 // ---------------------------------------------------------------- viewport: mouse
 overlay.addEventListener("pointermove", (e) => {
@@ -1268,6 +1410,7 @@ overlay.addEventListener("pointermove", (e) => {
     if (!d.moved && Math.hypot(dx, dy) < 3) return;
     d.moved = true;
     overlay.classList.add("dragging");
+    if (d.type === "marquee") { d.cur = pt; return; }
     if (d.type === "dom") { domDragMove(d, dx, dy, e.shiftKey); return; }
     if (d.type === "move") {
       if (e.shiftKey) { d.axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y"; } else d.axis = null;
@@ -1275,9 +1418,14 @@ overlay.addEventListener("pointermove", (e) => {
       if (d.axis === "y") dx = 0;
       const g0 = overlayToGlobal(d.startPt.x, d.startPt.y);
       const g1 = overlayToGlobal(d.startPt.x + dx, d.startPt.y + dy);
-      const parent = d.obj.parent;
-      const l0 = parent.toLocal(g0), l1 = parent.toLocal(g1);
-      moveTo(d.obj, Math.round(d.before.x + (l1.x - l0.x)), Math.round(d.before.y + (l1.y - l0.y)));
+      // Move every object in the group by the same global delta, each in its own parent's space.
+      for (const o of d.objs) {
+        const parent = o.parent;
+        if (!parent) continue;
+        const l0 = parent.toLocal(g0), l1 = parent.toLocal(g1);
+        const b = d.befores.get(o);
+        moveTo(o, Math.round(b.x + (l1.x - l0.x)), Math.round(b.y + (l1.y - l0.y)));
+      }
       renderComponentValues();
     } else if (d.type === "scale") {
       const v0 = { x: d.startPt.x - d.origin.x, y: d.startPt.y - d.origin.y };
@@ -1314,6 +1462,34 @@ overlay.addEventListener("pointermove", (e) => {
       let deg = ((d.before.rotation + a1 - a0) * 180) / Math.PI;
       deg = e.shiftKey ? Math.round(deg / 15) * 15 : Math.round(deg * 10) / 10;
       setLive(d.obj, { rotation: (deg * Math.PI) / 180 });
+    } else if (d.type === "group-scale") {
+      const v0 = { x: d.startPt.x - d.origin.x, y: d.startPt.y - d.origin.y };
+      const v1 = { x: pt.x - d.origin.x, y: pt.y - d.origin.y };
+      let kx, ky;
+      if (e.shiftKey) { kx = Math.abs(v0.x) > 4 ? v1.x / v0.x : 1; ky = Math.abs(v0.y) > 4 ? v1.y / v0.y : 1; }
+      else { const len0 = v0.x * v0.x + v0.y * v0.y || 1; kx = ky = (v1.x * v0.x + v1.y * v0.y) / len0; }
+      kx = Math.max(0.01, kx); ky = Math.max(0.01, ky); // don't flip when dragging past the centre
+      for (const o of d.objs) {
+        const b = d.befores.get(o);
+        const ng = { x: d.pivotG.x + (b.gp.x - d.pivotG.x) * kx, y: d.pivotG.y + (b.gp.y - d.pivotG.y) * ky };
+        setLive(o, { scaleX: Number((b.scaleX * kx).toFixed(3)), scaleY: Number((b.scaleY * ky).toFixed(3)) });
+        const lp = o.parent.toLocal(ng);
+        moveTo(o, Math.round(lp.x), Math.round(lp.y));
+      }
+    } else if (d.type === "group-rotate") {
+      const a0 = Math.atan2(d.startPt.y - d.origin.y, d.startPt.x - d.origin.x);
+      const a1 = Math.atan2(pt.y - d.origin.y, pt.x - d.origin.x);
+      let dA = a1 - a0;
+      if (e.shiftKey) dA = (Math.round((dA * 180) / Math.PI / 15) * 15 * Math.PI) / 180;
+      const cos = Math.cos(dA), sin = Math.sin(dA);
+      for (const o of d.objs) {
+        const b = d.befores.get(o);
+        const rx = b.gp.x - d.pivotG.x, ry = b.gp.y - d.pivotG.y;
+        const ng = { x: d.pivotG.x + rx * cos - ry * sin, y: d.pivotG.y + rx * sin + ry * cos };
+        setLive(o, { rotation: b.rotation + dA });
+        const lp = o.parent.toLocal(ng);
+        moveTo(o, Math.round(lp.x), Math.round(lp.y));
+      }
     }
     refreshInspectorValues();
     return;
@@ -1345,6 +1521,11 @@ overlay.addEventListener("pointerdown", (e) => {
     state.drag = domDragStart(state.domSelected, pt, "size", h.id);
     return;
   }
+  if (h && h.group) {
+    overlay.setPointerCapture(e.pointerId);
+    state.drag = startGroupTransform(h, pt);
+    return;
+  }
   if (h) {
     const o = state.selected;
     overlay.setPointerCapture(e.pointerId);
@@ -1370,11 +1551,15 @@ overlay.addEventListener("pointerdown", (e) => {
     state.drag = domDragStart(dsel, pt, "move", null, g);
     return;
   }
-  const sel = state.selected;
-  const sb = sel && !e.altKey && state.tool === "move" ? boundsOf(sel) : null;
-  if (sb && g.x >= sb.minX && g.x <= sb.maxX && g.y >= sb.minY && g.y <= sb.maxY && sel.parent) {
+  const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+  // Pressing inside the current selection drags the whole group (a plain click without dragging
+  // still re-selects just the top-most object, on pointerup). Modifier-clicks never group-drag.
+  const inSel = !e.altKey && !additive && state.tool === "move" && state.selected
+    ? selList().find((o) => { const b = boundsOf(o); return b && o.parent && g.x >= b.minX && g.x <= b.maxX && g.y >= b.minY && g.y <= b.maxY; })
+    : null;
+  if (inSel) {
     overlay.setPointerCapture(e.pointerId);
-    state.drag = { type: "move", obj: sel, startPt: pt, before: readVals(sel, ["x", "y"]), compBefore: compSnapshot(sel), moved: false, axis: null, clickPick: g };
+    state.drag = startMoveDrag(inSel, pt, g);
     return;
   }
   let target;
@@ -1387,6 +1572,17 @@ overlay.addEventListener("pointerdown", (e) => {
   } else {
     target = pickDom(pt) || pick(g.x, g.y); // HTML elements are drawn above the canvas
   }
+  // Shift/Cmd-click on an object adds it to (or toggles it in) the selection, without dragging.
+  if (additive && target && !isDom(target)) {
+    select(target, (e.metaKey || e.ctrlKey) ? "toggle" : "add");
+    return;
+  }
+  if (!target) {
+    // Empty space: box-select. A modifier keeps the current selection and adds to it.
+    overlay.setPointerCapture(e.pointerId);
+    state.drag = { type: "marquee", startPt: pt, cur: pt, additive, base: additive ? [...state.selection] : [], moved: false };
+    return;
+  }
   select(target);
   if (target && isDom(target)) {
     overlay.setPointerCapture(e.pointerId);
@@ -1395,7 +1591,7 @@ overlay.addEventListener("pointerdown", (e) => {
   }
   if (target && !isDom(target) && target.parent) {
     overlay.setPointerCapture(e.pointerId);
-    state.drag = { type: "move", obj: target, startPt: pt, before: readVals(target, ["x", "y"]), compBefore: compSnapshot(target), moved: false, axis: null };
+    state.drag = startMoveDrag(target, pt);
   }
 });
 overlay.addEventListener("pointerup", (e) => {
@@ -1404,12 +1600,31 @@ overlay.addEventListener("pointerup", (e) => {
   const d = state.drag;
   state.drag = null;
   overlay.classList.remove("dragging");
+  if (d && d.type === "marquee") {
+    if (!d.moved) { if (!d.additive) select(null); return; }
+    const hits = objectsInOverlayRect(normRect(d.startPt, d.cur));
+    const list = d.additive ? [...d.base, ...hits] : hits;
+    if (list.length) selectAll(list, list[list.length - 1]);
+    else if (!d.additive) select(null);
+    return;
+  }
   if (d && !d.moved && d.clickPick) { select(pickDom(d.startPt) || pick(d.clickPick.x, d.clickPick.y)); return; }
   if (!d || !d.moved) return;
   if (d.type === "dom") { domDragEnd(d); return; }
   if (d.type === "move") {
-    if (getComp(d.obj, "Anchor")) commit(d.obj, {}, {}, d.compBefore, compSnapshot(d.obj));
-    else commit(d.obj, d.before, readVals(d.obj, ["x", "y"]));
+    // Commit each object in the group (anchored objects save their Anchor offset).
+    for (const o of d.objs) {
+      if (getComp(o, "Anchor")) commit(o, {}, {}, d.compBefores.get(o), compSnapshot(o));
+      else commit(o, d.befores.get(o), readVals(o, ["x", "y"]));
+    }
+  } else if (d.type === "group-scale" || d.type === "group-rotate") {
+    // Commit each object's transform (position owned by an Anchor is saved as the component offset).
+    for (const o of d.objs) {
+      const b = d.befores.get(o);
+      const nums = { scaleX: b.scaleX, scaleY: b.scaleY, rotation: b.rotation };
+      if (getComp(o, "Anchor")) commit(o, nums, readVals(o, ["scaleX", "scaleY", "rotation"]), b.comp, compSnapshot(o));
+      else commit(o, { ...nums, x: b.x, y: b.y }, readVals(o, ["scaleX", "scaleY", "rotation", "x", "y"]));
+    }
   } else if (d.type === "pivot") {
     commitPivot(d.obj, d.before, d.compBefore);
   } else {
@@ -1463,11 +1678,14 @@ function onKey(e) {
   }
   if (sel && arrows[e.key]) {
     e.preventDefault();
-    const before = readVals(sel, ["x", "y"]);
-    const compBefore = compSnapshot(sel);
-    moveTo(sel, before.x + arrows[e.key][0], before.y + arrows[e.key][1]);
-    if (getComp(sel, "Anchor")) commit(sel, {}, {}, compBefore, compSnapshot(sel));
-    else commit(sel, before, readVals(sel, ["x", "y"]));
+    const [ox, oy] = arrows[e.key];
+    for (const o of selList()) {
+      const before = readVals(o, ["x", "y"]);
+      const compBefore = compSnapshot(o);
+      moveTo(o, before.x + ox, before.y + oy);
+      if (getComp(o, "Anchor")) commit(o, {}, {}, compBefore, compSnapshot(o));
+      else commit(o, before, readVals(o, ["x", "y"]));
+    }
   }
 }
 window.addEventListener("keydown", onKey);
@@ -1475,16 +1693,55 @@ window.addEventListener("keyup", (e) => { if (e.key === " ") { state.spaceDown =
 window.addEventListener("beforeunload", (e) => { if (pendingCount() && !state.stopped) { e.preventDefault(); e.returnValue = ""; } });
 
 // ---------------------------------------------------------------- selection
-function select(o) {
+// state.selection holds every selected Pixi object; state.selected is the primary (last-clicked)
+// one, used for the inspector header, the gizmo handles and as the drag anchor. Selecting an HTML
+// element of the page clears the Pixi selection (HTML is single-select only).
+function selList() { return state.selection.filter((o) => o && !o.destroyed); }
+function isSelected(o) { return state.selection.includes(o); }
+function multiSel() { return selList().length > 1; }
+
+/**
+ * Selects an object (or clears the selection with null). `mode`:
+ *   "replace" (default) — only this object; "toggle" — add/remove it; "add" — add it.
+ * HTML elements and null always replace.
+ */
+function select(o, mode = "replace") {
   const dom = isDom(o) ? o : null; // an HTML element of the page, or a Pixi object
-  if (state.selected === (dom ? null : o) && state.domSelected === dom) return;
-  state.selected = dom ? null : o;
-  state.domSelected = dom;
+  if (dom || !o) {
+    if (state.selected === (dom ? null : o) && state.domSelected === dom && state.selection.length <= 1) return;
+    state.selection = [];
+    state.selected = null;
+    state.domSelected = dom;
+  } else {
+    state.domSelected = null;
+    if (mode === "toggle") {
+      if (isSelected(o)) state.selection = state.selection.filter((x) => x !== o);
+      else state.selection.push(o);
+    } else if (mode === "add") {
+      if (!isSelected(o)) state.selection.push(o);
+    } else {
+      state.selection = [o];
+    }
+    // Primary = the object itself when it is still selected, otherwise the last remaining one.
+    state.selected = isSelected(o) ? o : state.selection[state.selection.length - 1] || null;
+  }
   if (o) { state.fileView = null; for (const r of document.querySelectorAll("#files .file.selected")) r.classList.remove("selected"); filesState.selected = null; }
-  markLinkedFile(o);
+  markLinkedFile(state.selected || state.domSelected);
   if (dom) { let p = dom.parentElement; while (p) { state.expanded.add(p); p = p.parentElement; } }
-  else if (o) { let p = o.parent; while (p) { state.expanded.add(p); p = p.parent; } }
+  for (const s of state.selection) { let p = s.parent; while (p) { state.expanded.add(p); p = p.parent; } }
   renderTree(true); // rebuilds only if expanding changed the tree; otherwise just moves the highlight
+  renderInspector();
+}
+
+/** Replaces the selection with a list of Pixi objects (primary = the last one). */
+function selectAll(list, primary = null) {
+  state.selection = [...new Set(list.filter((o) => o && !o.destroyed && o !== state.app.stage))];
+  state.domSelected = null;
+  state.selected = primary && isSelected(primary) ? primary : state.selection[state.selection.length - 1] || null;
+  state.fileView = null;
+  markLinkedFile(state.selected);
+  for (const s of state.selection) { let p = s.parent; while (p) { state.expanded.add(p); p = p.parent; } }
+  renderTree(true);
   renderInspector();
 }
 
@@ -1574,8 +1831,8 @@ function pickDom(pt) {
   for (; el && el !== doc.body && el !== doc.documentElement; el = el.parentElement) {
     if (isGameCanvas(el)) return null;
     const host = domHostOf(el);
-    if (host) return host; // the DOMContainer (a Pixi object), not its element
-    if (domShown(el)) return el;
+    if (host) { if (!isLocked(host)) return host; continue; } // the DOMContainer (a Pixi object), not its element
+    if (domShown(el) && !isLocked(el)) return el;
   }
   return null;
 }
@@ -1826,24 +2083,54 @@ function treeSignature() {
   if (!state.app) return "none";
   const parts = [state.treeQuery];
   (function walk(o) {
-    parts.push(uid(o), o.children.length, o.visible ? 1 : 0, isModified(o) ? 1 : 0);
+    parts.push(uid(o), o.children.length, o.visible ? 1 : 0, isModified(o) ? 1 : 0, isLockedSelf(o) ? 1 : 0);
     if (state.treeQuery) { for (const c of o.children) walk(c); return; } // search: the whole scene
     if (state.expanded.has(o)) for (const c of o.children.slice(0, MAX_CHILDREN)) walk(c);
   })(state.app.stage);
   const page = domPage();
   if (page) (function walkDom(el) {
     const kids = domKids(el);
-    parts.push(`h${uid(el)}`, kids.length, domVisible(el) ? 1 : 0, domHidden.has(el) ? 1 : 0, isModified(el) ? 1 : 0, nameOf(el));
+    parts.push(`h${uid(el)}`, kids.length, domVisible(el) ? 1 : 0, domHidden.has(el) ? 1 : 0, isModified(el) ? 1 : 0, isLockedSelf(el) ? 1 : 0, nameOf(el));
     if (state.treeQuery || state.expanded.has(el)) for (const c of kids.slice(0, MAX_CHILDREN)) walkDom(c);
   })(page);
   return parts.join(",");
 }
 function paintTreeSelection(scrollToSel = false) {
   for (const row of treeEl.querySelectorAll(".node")) {
-    const on = row._obj === (state.selected || state.domSelected);
+    const o = row._obj;
+    const on = (!isDom(o) && isSelected(o)) || o === state.domSelected;
     row.classList.toggle("selected", on);
-    if (on && scrollToSel) row.scrollIntoView({ block: "nearest" });
+    row.classList.toggle("primary", on && o === state.selected);
+    if (on && o === (state.selected || state.domSelected) && scrollToSel) row.scrollIntoView({ block: "nearest" });
   }
+}
+/** Pixi objects currently shown in the hierarchy, in order (for Shift range-select). */
+function visibleTreeObjects() {
+  return [...treeEl.querySelectorAll(".node")].map((r) => r._obj).filter((o) => o && !isDom(o) && o !== state.app.stage);
+}
+/** Handles a click on a hierarchy row, honouring Cmd/Ctrl (toggle) and Shift (range). */
+function treeClick(o, ev) {
+  if (o === state.app.stage) { select(null); return; }
+  if (isDom(o)) { select(o); return; } // HTML elements are single-select
+  if (ev && (ev.metaKey || ev.ctrlKey)) { select(o, "toggle"); state.lastTreeClick = o; return; }
+  if (ev && ev.shiftKey && state.lastTreeClick && !isDom(state.lastTreeClick) && state.lastTreeClick !== o) {
+    const rows = visibleTreeObjects();
+    const a = rows.indexOf(state.lastTreeClick), b = rows.indexOf(o);
+    if (a >= 0 && b >= 0) { const [lo, hi] = a < b ? [a, b] : [b, a]; selectAll(rows.slice(lo, hi + 1), o); return; }
+  }
+  select(o);
+  state.lastTreeClick = o;
+}
+/** The lock toggle shown on a hierarchy row: a locked object (and its subtree) can't be picked in
+ *  the scene, so it stops blocking clicks meant for things behind it. Editor-only, not saved. */
+function lockSpan(o) {
+  const on = isLockedSelf(o);
+  const span = document.createElement("span");
+  span.className = "lock" + (on ? " on" : "");
+  span.title = on ? "Locked — can't be selected in the scene (click to unlock)" : "Lock — stop it being selected in the scene";
+  span.textContent = on ? "🔒" : "🔓";
+  span.onclick = (ev) => { ev.stopPropagation(); toggleLocked(o); state.treeSig = ""; renderTree(); render(); };
+  return span;
 }
 function renderTree(scrollToSel = false) {
   if (!state.app) { treeEl.innerHTML = ""; return; }
@@ -1860,7 +2147,7 @@ function renderTree(scrollToSel = false) {
   (function add(o, depth) {
     if (filter && !filter.keep.has(o)) return;
     const row = document.createElement("div");
-    row.className = "node" + (o === state.selected ? " selected" : "") + (o.visible ? "" : " hidden");
+    row.className = "node" + (isSelected(o) ? " selected" : "") + (o === state.selected ? " primary" : "") + (o.visible ? "" : " hidden") + (isLockedSelf(o) ? " locked" : "");
     row.style.paddingLeft = `${6 + depth * 14}px`;
     row._obj = o;
     const has = o.children.length > 0;
@@ -1906,7 +2193,8 @@ function renderTree(scrollToSel = false) {
       renderTree();
     };
     row.append(caret, dot, name, type, eye);
-    row.onclick = () => select(o === state.app.stage ? null : o);
+    if (o !== state.app.stage) row.append(lockSpan(o));
+    row.onclick = (ev) => treeClick(o, ev);
     // Drag a row onto another to change its parent.
     if (o !== state.app.stage) {
       row.draggable = true;
@@ -1986,7 +2274,7 @@ function renderTree(scrollToSel = false) {
     if (filter && !filter.keep.has(el)) return;
     const kids = domKids(el);
     const row = document.createElement("div");
-    row.className = "node dom" + (el === page ? " dom-root" : "") + (el === state.domSelected ? " selected" : "") + (domVisible(el) ? "" : " hidden");
+    row.className = "node dom" + (el === page ? " dom-root" : "") + (el === state.domSelected ? " selected" : "") + (domVisible(el) ? "" : " hidden") + (isLockedSelf(el) ? " locked" : "");
     row.style.paddingLeft = `${6 + depth * 14}px`;
     row._obj = el;
     const has = kids.length > 0;
@@ -2024,7 +2312,7 @@ function renderTree(scrollToSel = false) {
       eye.title = off ? "Show" : "Hide while editing (not saved)";
       eye.textContent = off ? "○" : "◉";
       eye.onclick = (ev) => { ev.stopPropagation(); toggleDomHidden(el); state.treeSig = ""; renderTree(); };
-      row.append(eye);
+      row.append(eye, lockSpan(el));
     }
     row.title = "HTML element of the page";
     row.onclick = () => select(el === page ? null : el);
@@ -2282,6 +2570,7 @@ function renderInspector() {
   const o = state.selected;
   if (state.previewCleanup) { state.previewCleanup(); state.previewCleanup = null; }
   if (state.domSelected) { renderDomInspector(state.domSelected); return; }
+  if (multiSel()) { renderMultiInspector(selList()); return; }
   if (!o && state.fileView) { renderFileView(state.fileView); return; }
   if (!o) { inspectorEl.innerHTML = `<p class="empty">Select an object in the scene or in the hierarchy.</p>`; return; }
   inspectorEl.innerHTML = "";
@@ -2376,6 +2665,390 @@ function renderInspector() {
     });
   }
   refreshInspectorValues(true);
+}
+
+// ---------------------------------------------------------------- inspector: many objects
+/** The shared value of `prop` across the objects, or { mixed:true } when they differ. */
+function commonVal(objs, prop) {
+  let v, first = true;
+  for (const o of objs) {
+    const cur = propDef(prop).get(o);
+    if (first) { v = cur; first = false; }
+    else if (!sameValue(cur, v)) return { mixed: true };
+  }
+  return { value: v };
+}
+/** Sets one property on one object and commits it (anchored objects keep their place). */
+function applyPropOne(o, prop, raw) {
+  if ((prop === "x" || prop === "y") && getComp(o, "Anchor")) {
+    const compBefore = compSnapshot(o);
+    const cur = readVals(o, ["x", "y"]);
+    cur[prop] = raw;
+    moveTo(o, cur.x, cur.y);
+    commit(o, {}, {}, compBefore, compSnapshot(o));
+  } else {
+    const before = readVals(o, [prop]);
+    setLive(o, { [prop]: raw });
+    commit(o, before, { [prop]: raw });
+  }
+}
+
+/** Translates each object by a global vector and commits (used by align / distribute). */
+function translateAndCommit(o, dgx, dgy) {
+  if (!o.parent || (dgx === 0 && dgy === 0)) return;
+  const before = readVals(o, ["x", "y"]);
+  const compBefore = compSnapshot(o);
+  const l0 = o.parent.toLocal({ x: 0, y: 0 });
+  const l1 = o.parent.toLocal({ x: dgx, y: dgy });
+  moveTo(o, Math.round(before.x + (l1.x - l0.x)), Math.round(before.y + (l1.y - l0.y)));
+  if (getComp(o, "Anchor")) commit(o, {}, {}, compBefore, compSnapshot(o));
+  else commit(o, before, readVals(o, ["x", "y"]));
+}
+function alignSelection(kind) {
+  const objs = selList();
+  const gb = selectionGlobalBounds();
+  if (objs.length < 2 || !gb) return;
+  for (const o of objs) {
+    const b = boundsOf(o);
+    if (!b) continue;
+    let dgx = 0, dgy = 0;
+    if (kind === "left") dgx = gb.minX - b.minX;
+    else if (kind === "centerX") dgx = (gb.minX + gb.maxX) / 2 - (b.minX + b.maxX) / 2;
+    else if (kind === "right") dgx = gb.maxX - b.maxX;
+    else if (kind === "top") dgy = gb.minY - b.minY;
+    else if (kind === "middleY") dgy = (gb.minY + gb.maxY) / 2 - (b.minY + b.maxY) / 2;
+    else if (kind === "bottom") dgy = gb.maxY - b.maxY;
+    translateAndCommit(o, dgx, dgy);
+  }
+  refreshMultiValues(true);
+  setStatus(`Aligned ${objs.length} objects`);
+}
+function distributeSelection(axis) {
+  const items = selList().map((o) => ({ o, b: boundsOf(o) })).filter((x) => x.b && x.o.parent);
+  if (items.length < 3) return;
+  const center = (b) => (axis === "x" ? (b.minX + b.maxX) / 2 : (b.minY + b.maxY) / 2);
+  items.sort((a, b) => center(a.b) - center(b.b));
+  const first = center(items[0].b), last = center(items[items.length - 1].b);
+  const stepv = (last - first) / (items.length - 1);
+  items.forEach((it, i) => {
+    if (i === 0 || i === items.length - 1) return;
+    const dg = first + stepv * i - center(it.b);
+    translateAndCommit(it.o, axis === "x" ? dg : 0, axis === "x" ? 0 : dg);
+  });
+  refreshMultiValues(true);
+  setStatus(`Distributed ${items.length} objects`);
+}
+
+function multiNumberRow(objs, f) {
+  const row = document.createElement("div");
+  row.className = "row" + (f.props.length === 1 ? " single" : "");
+  const label = document.createElement("label");
+  label.textContent = f.label;
+  label.title = "Drag to adjust every selected object";
+  row.appendChild(label);
+  for (const [prop, axis, , , range] of f.props) {
+    const wrap = document.createElement("div");
+    wrap.className = "field";
+    wrap.dataset.mprop = prop;
+    if (f.props.length > 1) { const sp = document.createElement("span"); sp.textContent = axis; wrap.appendChild(sp); }
+    const input = document.createElement("input");
+    input.type = "text";
+    input.inputMode = "decimal";
+    input.dataset.mprop = prop;
+    input.addEventListener("focus", () => input.select());
+    input.addEventListener("change", () => {
+      let v = parseFloat(input.value);
+      if (!isFinite(v)) { refreshMultiValues(true); return; }
+      if (range) v = Math.min(range[1], Math.max(range[0], v));
+      const raw = fromView(prop, v);
+      for (const o of objs) applyPropOne(o, prop, raw);
+      refreshMultiValues(true);
+    });
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+    wrap.appendChild(input);
+    row.appendChild(wrap);
+  }
+  // Dragging the label scrubs every object by the same delta, keeping differences between them.
+  label.addEventListener("pointerdown", (e) => {
+    const starts = objs.map((o) => ({ o, comp: compSnapshot(o), vals: Object.fromEntries(f.props.map(([p]) => [p, propDef(p).get(o)])) }));
+    const x0 = e.clientX;
+    label.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      for (const st of starts) {
+        for (const [prop, , step, , range] of f.props) {
+          let v = toView(prop, st.vals[prop]) + (ev.clientX - x0) * step;
+          if (range) v = Math.min(range[1], Math.max(range[0], v));
+          const raw = fromView(prop, step >= 1 ? Math.round(v) : Number(v.toFixed(3)));
+          if ((prop === "x" || prop === "y") && getComp(st.o, "Anchor")) { const cur = readVals(st.o, ["x", "y"]); cur[prop] = raw; moveTo(st.o, cur.x, cur.y); }
+          else setLive(st.o, { [prop]: raw });
+        }
+      }
+      refreshMultiValues(true);
+    };
+    const up = () => {
+      label.removeEventListener("pointermove", move);
+      label.removeEventListener("pointerup", up);
+      for (const st of starts) {
+        if (f.props.some(([p]) => p === "x" || p === "y") && getComp(st.o, "Anchor")) commit(st.o, {}, {}, st.comp, compSnapshot(st.o));
+        else commit(st.o, st.vals, Object.fromEntries(f.props.map(([p]) => [p, propDef(p).get(st.o)])));
+      }
+    };
+    label.addEventListener("pointermove", move);
+    label.addEventListener("pointerup", up);
+  });
+  return row;
+}
+
+function multiColorRow(objs, prop, labelText) {
+  const row = document.createElement("div");
+  row.className = "row single";
+  row.innerHTML = `<label></label><div class="field color-field"><input type="color"><input type="text" spellcheck="false"></div>`;
+  row.querySelector("label").textContent = labelText;
+  const [picker, hex] = row.querySelectorAll("input");
+  picker.dataset.mvprop = prop;
+  hex.dataset.mvprop = prop;
+  hex.dataset.hex = "1";
+  let befores = null;
+  const applyAll = (n, done) => {
+    if (!befores) befores = new Map(objs.map((o) => [o, readVals(o, [prop])]));
+    for (const o of objs) setLive(o, { [prop]: n });
+    if (done) { for (const o of objs) commit(o, befores.get(o), { [prop]: n }); befores = null; }
+    refreshMultiValues(true);
+  };
+  picker.addEventListener("input", () => applyAll(parseInt(picker.value.slice(1), 16), false));
+  picker.addEventListener("change", () => applyAll(parseInt(picker.value.slice(1), 16), true));
+  hex.addEventListener("change", () => {
+    const n = colorToNumber(hex.value.startsWith("#") ? hex.value : "#" + hex.value);
+    if (n == null) { refreshMultiValues(true); return; }
+    applyAll(n, true);
+  });
+  hex.addEventListener("keydown", (e) => { if (e.key === "Enter") hex.blur(); });
+  return row;
+}
+
+function renderMultiComponents(objs) {
+  const sec = document.createElement("div");
+  sec.className = "section components";
+  sec.innerHTML = `<h4>Components</h4>`;
+  const mod = state.compMod;
+  if (!mod) { sec.insertAdjacentHTML("beforeend", `<p class="note">Loading components…</p>`); return sec; }
+  // Component types present on every selected object (schema-backed only).
+  const shared = COMPONENT_TYPES.filter((t) => SCHEMAS[t] && objs.every((o) => !!getComp(o, t)));
+  for (const type of shared) {
+    const schema = SCHEMAS[type];
+    const card = document.createElement("div");
+    card.className = "comp";
+    card.dataset.type = type;
+    card.innerHTML = `<div class="comp-head"><span class="comp-name"></span><button class="comp-remove" title="Remove from all selected">✕</button></div><p class="comp-help"></p>`;
+    card.querySelector(".comp-name").textContent = type;
+    card.querySelector(".comp-help").textContent = schema.help;
+    card.querySelector(".comp-remove").onclick = () => { for (const o of objs) changeComponent(o, () => mod.removeComponent(o, mod.componentTypes[type])); renderInspector(); };
+    for (const fld of schema.fields) {
+      const r = document.createElement("div");
+      r.className = "row single";
+      const lab = document.createElement("label");
+      lab.textContent = fld.label;
+      r.appendChild(lab);
+      const wrap = document.createElement("div");
+      wrap.className = "field";
+      const applyToAll = (v) => {
+        for (const o of objs) {
+          const comp = getComp(o, type);
+          if (!comp) continue;
+          changeComponent(o, () => { comp.params = { ...comp.params, [fld.key]: v }; comp.apply(); });
+        }
+        refreshMultiValues(true);
+      };
+      if (fld.type === "boolean") {
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.dataset.mcomp = type;
+        box.dataset.key = fld.key;
+        box.dataset.bool = "1";
+        box.addEventListener("change", () => applyToAll(box.checked));
+        wrap.classList.add("bool-field");
+        wrap.appendChild(box);
+        r.appendChild(wrap);
+        card.appendChild(r);
+        continue;
+      }
+      if (fld.type === "color") {
+        wrap.classList.add("color-field");
+        const picker = document.createElement("input");
+        picker.type = "color";
+        const hex = document.createElement("input");
+        hex.type = "text";
+        hex.spellcheck = false;
+        for (const el of [picker, hex]) { el.dataset.mcomp = type; el.dataset.key = fld.key; }
+        hex.dataset.hex = "1";
+        picker.addEventListener("input", () => applyToAll(parseInt(picker.value.slice(1), 16)));
+        hex.addEventListener("change", () => {
+          const n = colorToNumber(hex.value.startsWith("#") ? hex.value : "#" + hex.value);
+          if (n == null) { refreshMultiValues(true); return; }
+          applyToAll(n);
+        });
+        hex.addEventListener("keydown", (e) => { if (e.key === "Enter") hex.blur(); });
+        wrap.append(picker, hex);
+        r.appendChild(wrap);
+        card.appendChild(r);
+        continue;
+      }
+      let input;
+      if (fld.type === "select") { input = document.createElement("select"); for (const opt of fld.options) { const el = document.createElement("option"); el.value = el.textContent = opt; input.appendChild(el); } }
+      else { input = document.createElement("input"); input.type = "text"; input.inputMode = "decimal"; }
+      input.dataset.mcomp = type;
+      input.dataset.key = fld.key;
+      input.addEventListener("change", () => {
+        let v = input.value;
+        if (fld.type === "number") { v = parseFloat(v); if (!isFinite(v)) { refreshMultiValues(true); return; } }
+        for (const o of objs) {
+          const comp = getComp(o, type);
+          if (!comp) continue;
+          changeComponent(o, () => {
+            const next = { ...comp.params, [fld.key]: v };
+            if (type === "Tween" && fld.key === "kind") next.amount = TWEEN_AMOUNT[v] ?? next.amount;
+            comp.params = next;
+            if (type === "Anchor" && (fld.key === "h" || fld.key === "v")) comp.setFromPosition(o.x, o.y);
+            else comp.apply();
+          });
+        }
+        refreshMultiValues(true);
+      });
+      if (fld.type === "number") input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+      wrap.appendChild(input);
+      r.appendChild(wrap);
+      card.appendChild(r);
+    }
+    sec.appendChild(card);
+  }
+  const present = new Set(shared);
+  const add = document.createElement("select");
+  add.className = "comp-add";
+  add.innerHTML =
+    `<option value="">+ Add component to all…</option>` +
+    COMPONENT_CATEGORIES.map((cat) => {
+      const list = cat.components.map((c) => c.name).filter((t) => !present.has(t));
+      return list.length ? `<optgroup label="${escapeHtml(cat.label)}">${list.map((t) => `<option value="${t}">${t}</option>`).join("")}</optgroup>` : "";
+    }).join("");
+  add.onchange = () => { const v = add.value; add.value = ""; if (v) addComponentToAll(objs, v); };
+  sec.appendChild(add);
+  return sec;
+}
+
+/** Adds a component to every selected object that is stored in a code variable. */
+async function addComponentToAll(objs, type) {
+  const mod = state.compMod;
+  let added = 0;
+  const skipped = [];
+  for (const o of objs) {
+    const m = metaOf(o);
+    if (m && m.declId) await loadInfo([m.declId]);
+    if (!m || !m.declId || !state.info.get(m.declId)?.canInsert) { skipped.push(nameOf(o)); continue; }
+    if (getComp(o, type)) continue;
+    const params = { ...mod.componentTypes[type].defaults };
+    changeComponent(o, () => {
+      if (type === "Anchor") {
+        const gp = o.getGlobalPosition();
+        const s = state.app.screen;
+        params.h = gp.x < s.width / 3 ? "left" : gp.x > (s.width * 2) / 3 ? "right" : "center";
+        params.v = gp.y < s.height / 3 ? "top" : gp.y > (s.height * 2) / 3 ? "bottom" : "middle";
+        const x = o.x, y = o.y;
+        const c = mod.addComponent(o, mod.componentTypes.Anchor, params);
+        c.setFromPosition(x, y);
+      } else mod.addComponent(o, mod.componentTypes[type], params);
+    });
+    added++;
+  }
+  renderInspector();
+  if (skipped.length) setStatus(`Added ${type} to ${added}; skipped ${skipped.length} with no code variable (${skipped.slice(0, 3).join(", ")}${skipped.length > 3 ? "…" : ""}).`, added ? "ok" : "err");
+  else setStatus(`Added ${type} to ${added} object${added === 1 ? "" : "s"}.`, "ok");
+}
+
+function refreshMultiValues(force = false) {
+  const objs = selList();
+  if (!objs.length) return;
+  for (const input of inspectorEl.querySelectorAll("input[data-mprop]")) {
+    if (document.activeElement === input && !force) continue;
+    if (document.activeElement === input) continue;
+    const prop = input.dataset.mprop;
+    const c = commonVal(objs, prop);
+    if (c.mixed) { input.value = ""; input.placeholder = "Mixed"; }
+    else { input.value = fmtNum(toView(prop, c.value), prop === "x" || prop === "y" ? 2 : 3); input.placeholder = ""; }
+    input.parentElement.classList.toggle("changed", objs.some((o) => state.pending.has(`${uid(o)}:${prop}`)));
+  }
+  for (const input of inspectorEl.querySelectorAll("[data-mvprop]")) {
+    if (document.activeElement === input) continue;
+    const c = commonVal(objs, input.dataset.mvprop);
+    if (c.mixed) { if (input.type === "color") input.value = "#000000"; else { input.value = ""; input.placeholder = "Mixed"; } }
+    else { input.value = toHex(c.value); input.placeholder = ""; }
+  }
+  for (const input of inspectorEl.querySelectorAll("[data-mcomp]")) {
+    if (document.activeElement === input) continue;
+    const comp = getComp(state.selected, input.dataset.mcomp);
+    if (!comp) continue;
+    const v = comp.params[input.dataset.key];
+    if (input.dataset.bool) { input.checked = !!v; continue; }
+    if (input.dataset.hex || input.type === "color") { input.value = toHex(v); continue; }
+    input.value = typeof v === "number" ? fmtNum(v, 3) : String(v);
+  }
+}
+
+function renderMultiInspector(objs) {
+  inspectorEl.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "obj-head";
+  head.innerHTML = `<div class="obj-row"><div class="obj-name multi"></div><button class="ghost icon-btn" data-act="dup" title="Duplicate all (Ctrl/Cmd+D)">⧉</button><button class="ghost icon-btn" data-act="del" title="Delete all (Delete key)">🗑</button></div><div class="obj-type"></div>`;
+  head.querySelector(".obj-name").textContent = `${objs.length} objects`;
+  const types = [...new Set(objs.map(typeOf))];
+  head.querySelector(".obj-type").textContent = types.length === 1 ? `all ${types[0]}` : `${types.slice(0, 3).join(", ")}${types.length > 3 ? "…" : ""}`;
+  head.querySelector('[data-act="dup"]').onclick = () => duplicateSelected();
+  head.querySelector('[data-act="del"]').onclick = () => deleteSelected();
+  inspectorEl.appendChild(head);
+
+  // Align & distribute
+  const align = document.createElement("div");
+  align.className = "section";
+  align.innerHTML = `<h4>Align</h4>`;
+  const mkBtns = (defs) => {
+    const wrap = document.createElement("div");
+    wrap.className = "align-row";
+    for (const [kind, label, title] of defs) {
+      const b = document.createElement("button");
+      b.className = "ghost align-btn";
+      b.textContent = label;
+      b.title = title;
+      b.onclick = () => (kind === "distX" || kind === "distY") ? distributeSelection(kind === "distX" ? "x" : "y") : alignSelection(kind);
+      wrap.appendChild(b);
+    }
+    return wrap;
+  };
+  align.appendChild(mkBtns([["left", "⇤", "Align left edges"], ["centerX", "⇔", "Align horizontal centers"], ["right", "⇥", "Align right edges"], ["top", "⤒", "Align top edges"], ["middleY", "⇕", "Align vertical centers"], ["bottom", "⤓", "Align bottom edges"]]));
+  if (objs.length >= 3) align.appendChild(mkBtns([["distX", "↔", "Distribute horizontally"], ["distY", "↕", "Distribute vertically"]]));
+  inspectorEl.appendChild(align);
+
+  // Transform (common numeric fields)
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML = `<h4>Transform</h4>`;
+  for (const f of FIELDS) sec.appendChild(multiNumberRow(objs, f));
+  inspectorEl.appendChild(sec);
+
+  // Appearance: tint and text color when they apply to every object
+  const app = document.createElement("div");
+  app.className = "section";
+  app.innerHTML = `<h4>Appearance</h4>`;
+  if (objs.every((o) => typeof o.tint === "number" && !domElementOf(o))) app.appendChild(multiColorRow(objs, "tint", "Tint"));
+  if (objs.every((o) => o.style && colorToNumber(o.style.fill) != null)) app.appendChild(multiColorRow(objs, "textFill", "Text color"));
+  if (app.children.length > 1) inspectorEl.appendChild(app);
+
+  inspectorEl.appendChild(renderMultiComponents(objs));
+
+  const note = document.createElement("div");
+  note.className = "section";
+  note.innerHTML = `<p class="note">Edits apply to all ${objs.length} selected objects. A blank field means they differ.</p>`;
+  inspectorEl.appendChild(note);
+
+  refreshMultiValues(true);
 }
 
 // ---------------------------------------------------------------- HTML element inspector
@@ -3157,6 +3830,54 @@ function renderComponents(o) {
       row.appendChild(label);
       const wrap = document.createElement("div");
       wrap.className = "field";
+      // Boolean (checkbox) and colour (picker + hex) fields have their own widgets.
+      if (f.type === "boolean") {
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.dataset.comp = type;
+        box.dataset.key = f.key;
+        box.dataset.bool = "1";
+        box.addEventListener("change", () => {
+          const comp = getComp(o, type);
+          if (!comp) return;
+          changeComponent(o, () => { comp.params = { ...comp.params, [f.key]: box.checked }; comp.apply(); });
+          renderComponentValues();
+          refreshInspectorValues(true);
+        });
+        wrap.classList.add("bool-field");
+        wrap.appendChild(box);
+        row.appendChild(wrap);
+        card.appendChild(row);
+        continue;
+      }
+      if (f.type === "color") {
+        wrap.classList.add("color-field");
+        const picker = document.createElement("input");
+        picker.type = "color";
+        const hex = document.createElement("input");
+        hex.type = "text";
+        hex.spellcheck = false;
+        for (const el of [picker, hex]) { el.dataset.comp = type; el.dataset.key = f.key; }
+        hex.dataset.hex = "1";
+        const applyColor = (n) => {
+          const comp = getComp(o, type);
+          if (!comp) return;
+          changeComponent(o, () => { comp.params = { ...comp.params, [f.key]: n }; comp.apply(); });
+          renderComponentValues();
+          refreshInspectorValues(true);
+        };
+        picker.addEventListener("input", () => applyColor(parseInt(picker.value.slice(1), 16)));
+        hex.addEventListener("change", () => {
+          const n = colorToNumber(hex.value.startsWith("#") ? hex.value : "#" + hex.value);
+          if (n == null) { renderComponentValues(); return; }
+          applyColor(n);
+        });
+        hex.addEventListener("keydown", (e) => { if (e.key === "Enter") hex.blur(); });
+        wrap.append(picker, hex);
+        row.appendChild(wrap);
+        card.appendChild(row);
+        continue;
+      }
       let input;
       if (f.type === "select") {
         input = document.createElement("select");
@@ -3377,6 +4098,7 @@ async function createBehaviorFor(o, name) {
 }
 
 function renderComponentValues() {
+  if (multiSel()) return;
   const o = state.selected;
   if (!o) return;
   for (const input of inspectorEl.querySelectorAll("[data-comp]")) {
@@ -3384,6 +4106,8 @@ function renderComponentValues() {
     const comp = getComp(o, input.dataset.comp);
     if (!comp) continue;
     const v = comp.params[input.dataset.key];
+    if (input.dataset.bool) { input.checked = !!v; continue; }
+    if (input.dataset.hex || input.type === "color") { input.value = toHex(v); continue; }
     input.value = typeof v === "number" ? fmtNum(v, 3) : String(v);
   }
   const changed = new Set(compChanges().filter((c) => c.obj === o).map((c) => c.type));
@@ -3391,6 +4115,7 @@ function renderComponentValues() {
 }
 
 function refreshInspectorValues(force = false) {
+  if (multiSel()) { refreshMultiValues(force); return; }
   if (state.domSelected) { refreshDomValues(force); return; }
   const o = state.selected;
   if (!o) return;
@@ -4023,7 +4748,13 @@ function reparent(o, target, quiet = false) {
 
 // Small hook for automated tests (Playwright): select an object of the game.
 window.pixiEditor = {
-  select: (o) => select(o),
+  select: (o, mode) => select(o, mode),
+  selectMany: (list, primary) => selectAll(list, primary),
+  selection: () => selList(),
+  setLocked: (o, on) => { if (on === undefined ? !isLockedSelf(o) : on) locked.add(o); else locked.delete(o); state.treeSig = ""; renderTree(); render(); },
+  isLocked: (o) => isLocked(o),
+  pick: (gx, gy) => pick(gx, gy),
+  groupRect: () => selectionOverlayRect(),
   openFile: (p, size = 0) => openFileView({ name: p.split("/").pop(), path: p, size, type: "file" }),
 };
 
@@ -4075,7 +4806,42 @@ function forgetObject(o) {
 }
 
 async function deleteSelected() {
-  const o = state.selected;
+  const objs = selList().filter((o) => o !== state.app.stage);
+  if (objs.length > 1) return deleteMany(objs);
+  return deleteOne(state.selected);
+}
+async function deleteMany(objs) {
+  const deletable = [], skipped = [];
+  for (const o of objs) { const m = metaOf(o); (m && m.declId ? deletable : skipped).push(o); }
+  if (!deletable.length) { setStatus("None of the selected objects are linked to the code that creates them.", "err"); return; }
+  setStatus(`Checking ${deletable.length} objects…`);
+  const diffs = [], notes = [`Deletes ${deletable.length} objects and every line that sets them up.`];
+  if (skipped.length) notes.push(`${skipped.length} not linked to code are left as they are.`);
+  for (const o of deletable) {
+    const plan = await objectRequest({ action: "delete", declId: metaOf(o).declId, dryRun: true });
+    if (!plan.ok) { notes.push(`${nameOf(o)}: ${plan.error}`); continue; }
+    for (const d of plan.diffs) diffs.push(d);
+  }
+  if (!(await confirmCode({ title: `Delete ${deletable.length} objects`, sub: "These lines are removed from the code", notes, diffs, confirmLabel: "Delete" }))) { setStatus("Delete canceled"); return; }
+  let ok = 0; const files = new Set();
+  for (const o of deletable) {
+    const m = metaOf(o);
+    if (!m || !m.declId) continue;
+    const res = await objectRequest({ action: "delete", declId: m.declId });
+    if (!res.ok) { setStatus(`${nameOf(o)}: ${res.error}`, "err"); continue; }
+    forgetObject(o);
+    if (o.parent) o.parent.removeChild(o);
+    files.add(res.file);
+    ok++;
+  }
+  select(null);
+  state.info.clear();
+  state.treeSig = "";
+  updateSaveButton();
+  render();
+  setStatus(`Deleted ${ok} object${ok === 1 ? "" : "s"}${files.size ? ` from ${[...files].join(", ")}` : ""}`, ok ? "ok" : "err");
+}
+async function deleteOne(o) {
   if (!o || o === state.app.stage) return;
   const m = metaOf(o);
   if (!m || !m.declId) { setStatus(`${nameOf(o)} is not linked to the code that creates it, so it can't be deleted from here.`, "err"); return; }
@@ -4133,7 +4899,39 @@ function cloneLive(o) {
 }
 
 async function duplicateSelected() {
-  const o = state.selected;
+  const objs = selList().filter((o) => o !== state.app.stage);
+  if (objs.length > 1) return duplicateMany(objs);
+  return duplicateOne(state.selected);
+}
+async function duplicateMany(objs) {
+  const dupable = objs.filter((o) => { const m = metaOf(o); return m && m.declId && !isModified(o); });
+  if (!dupable.length) { setStatus("The selected objects can't be duplicated (no code variable, or unsaved changes — save first).", "err"); return; }
+  setStatus(`Duplicating ${dupable.length} objects…`);
+  const copies = [];
+  for (const o of dupable) {
+    const res = await objectRequest({ action: "duplicate", declId: metaOf(o).declId });
+    if (!res.ok) { setStatus(`${nameOf(o)}: ${res.error}`, "err"); continue; }
+    state.info.clear();
+    const c = cloneLive(o);
+    if (!c) {
+      state.afterReload = `Duplicated ${dupable.length} objects — game reloaded`;
+      setStatus(`Duplicated — reloading the game to show the copies…`, "ok");
+      iframe.contentWindow.location.reload();
+      return;
+    }
+    const p = o.parent;
+    p.addChildAt(c, p.getChildIndex(o) + 1);
+    state.pe.d(c, res.declId, res.name, res.opts);
+    for (const st of res.sites || []) state.pe.s(c, st.kind, st.id);
+    for (const st of res.elementSites || []) if (c.element) state.pe.s(c.element, st.kind, st.id);
+    copies.push(c);
+  }
+  state.treeSig = "";
+  if (copies.length) selectAll(copies, copies[copies.length - 1]);
+  render();
+  setStatus(`Duplicated ${copies.length} object${copies.length === 1 ? "" : "s"} — they sit on top of the originals: drag them away.`, "ok");
+}
+async function duplicateOne(o) {
   if (!o || o === state.app.stage) return;
   const m = metaOf(o);
   if (!m || !m.declId) { setStatus(`${nameOf(o)} is not linked to the code that creates it, so it can't be duplicated from here.`, "err"); return; }

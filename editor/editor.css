@@ -93,6 +93,8 @@ body.resizing iframe { pointer-events: none; }
 }
 .node:hover { background: var(--panel-2); }
 .node.selected { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.node.selected.primary { box-shadow: inset 3px 0 0 var(--accent); }
+.node.selected:not(.primary) { background: color-mix(in srgb, var(--accent-soft) 60%, transparent); }
 .node.hidden .name { opacity: .45; }
 .node .caret { width: 14px; text-align: center; color: var(--faint); flex: none; font-size: 9px; }
 .node .caret.has { cursor: pointer; color: var(--dim); }
@@ -271,6 +273,8 @@ input.obj-name:focus { outline: none; border-color: var(--sel); background: var(
 .color-field input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
 .color-field input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 3px; }
 .color-field input[type="text"] { padding-left: 7px; }
+.bool-field { display: flex; align-items: center; min-height: 24px; }
+.bool-field input[type="checkbox"] { width: 16px; height: 16px; margin: 0; cursor: pointer; accent-color: var(--accent); }
 .text-row { align-items: start; }
 .field textarea {
   width: 100%; resize: vertical; min-height: 28px; background: var(--bg); color: var(--text);
@@ -282,6 +286,12 @@ input.obj-name:focus { outline: none; border-color: var(--sel); background: var(
 .node:hover .eye, .node .eye.off { opacity: 1; }
 .node .eye:hover { color: var(--text); }
 .node .eye.off { color: var(--warn); }
+.node .lock { width: 16px; text-align: center; flex: none; cursor: pointer; font-size: 10px; margin-left: 2px; opacity: 0; filter: grayscale(1); }
+.node:hover .lock, .node .lock.on { opacity: 1; }
+.node:hover .lock { opacity: .5; }
+.node:hover .lock:hover, .node .lock.on { opacity: 1; filter: none; }
+.node.locked > .name { opacity: .5; }
+.node.locked > .type { font-style: italic; }
 .tools {
   position: absolute; left: 10px; top: 10px; z-index: 4; display: flex; flex-direction: column;
   background: var(--panel); border: 1px solid var(--line); border-radius: 7px; overflow: hidden;
@@ -576,3 +586,14 @@ input.obj-name:focus { outline: none; border-color: var(--sel); background: var(
 .css-rule-head .where.link { cursor: pointer; }
 .css-rule-head .where.link:hover { color: var(--text); text-decoration: underline; }
 .css-rule .note { margin: 0 0 6px; }
+
+/* Multi-selection inspector */
+.obj-name.multi { color: var(--accent); }
+.align-row { display: flex; gap: 6px; margin: 2px 0 6px; }
+.align-row + .align-row { margin-top: 0; }
+.align-btn {
+  flex: 1; height: 28px; padding: 0; display: grid; place-items: center;
+  font-size: 15px; line-height: 1; cursor: pointer;
+}
+.align-btn:hover { color: var(--text); border-color: var(--sel); }
+.field.changed input[data-mprop], .field input[data-mprop] { width: 100%; }
